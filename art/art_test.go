@@ -7,66 +7,60 @@ import (
 	"time"
 	"unsafe"
 
-	. "github.com/pingcap/check"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/tablecodec"
+	"github.com/stretchr/testify/require"
 )
 
-func Test(t *testing.T) { TestingT(t) }
-
-type ArtSuite struct{}
-
-var _ = Suite(&ArtSuite{})
-
-func (s *ArtSuite) putAndCheck(c *C, t *ART, keys [][]byte) {
+func putAndCheck(t *testing.T, a *ART, keys [][]byte) {
 	for _, k := range keys {
-		t.Put(k, k)
+		a.Put(k, k)
 	}
 
 	for _, k := range keys {
-		v, ok := t.Get(k)
-		c.Assert(ok, IsTrue)
-		c.Assert(v, BytesEquals, k)
+		v, ok := a.Get(k)
+		require.True(t, ok)
+		require.Equal(t, k, v)
 	}
 }
 
-func (s *ArtSuite) sleep() {
+func sleep() {
 	time.Sleep(10 * time.Millisecond)
 }
 
-func (s *ArtSuite) TestBasic(c *C) {
-	t := New()
+func TestBasic(t *testing.T) {
+	a := New()
 	k, v := []byte("hello"), []byte("world")
-	t.Put(k, v)
-	v1, ok := t.Get(k)
-	c.Assert(ok, IsTrue)
-	c.Assert(v1, BytesEquals, v)
+	a.Put(k, v)
+	v1, ok := a.Get(k)
+	require.True(t, ok)
+	require.Equal(t, v, v1)
 
-	t.Delete([]byte("foobar"))
-	v1, ok = t.Get(k)
-	c.Assert(ok, IsTrue)
-	c.Assert(v1, BytesEquals, v)
+	a.Delete([]byte("foobar"))
+	v1, ok = a.Get(k)
+	require.True(t, ok)
+	require.Equal(t, v, v1)
 
-	t.Delete(k)
-	v1, ok = t.Get(k)
-	c.Assert(ok, IsFalse)
+	a.Delete(k)
+	v1, ok = a.Get(k)
+	require.False(t, ok)
 }
 
-func (s *ArtSuite) TestMoreKeys(c *C) {
-	t := New()
+func TestMoreKeys(t *testing.T) {
+	a := New()
 	es := genEntries(500000)
 	for _, e := range es {
-		t.Put(e.k[:], e.v)
+		a.Put(e.k[:], e.v)
 	}
 	for _, e := range es {
-		v, ok := t.Get(e.k[:])
-		c.Assert(ok, IsTrue)
-		c.Assert(v, BytesEquals, e.v)
+		v, ok := a.Get(e.k[:])
+		require.True(t, ok)
+		require.Equal(t, e.v, v)
 	}
 }
 
-func (s *ArtSuite) TestPrefixLeaf(c *C) {
-	t := New()
+func TestPrefixLeaf(t *testing.T) {
+	a := New()
 	keys := [][]byte{
 		{1},
 		{1, 2, 3, 4},
@@ -82,27 +76,28 @@ func (s *ArtSuite) TestPrefixLeaf(c *C) {
 		{3, 2},
 	}
 
-	s.putAndCheck(c, t, keys)
+	putAndCheck(t, a, keys)
 }
 
-func (s *ArtSuite) TestEmptyKey(c *C) {
-	t := New()
-	t.Put([]byte{}, []byte("empty"))
-	v, ok := t.Get([]byte{})
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, []byte("empty"))
+func TestEmptyKey(t *testing.T) {
+	a := New()
+	a.Put([]byte{}, []byte("empty"))
+	v, ok := a.Get([]byte{})
+	require.True(t, ok)
+	require.Equal(t, []byte("empty"), v)
 
-	t.Put(nil, []byte("nil"))
-	v, ok = t.Get(nil)
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, []byte("nil"))
-	v, ok = t.Get([]byte{})
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, []byte("nil"))
+	a.Put(nil, []byte("nil"))
+	v, ok = a.Get(nil)
+	require.True(t, ok)
+	require.Equal(t, []byte("nil"), v)
+
+	v, ok = a.Get([]byte{})
+	require.True(t, ok)
+	require.Equal(t, []byte("nil"), v)
 }
 
-func (s *ArtSuite) TestExpandLeaf(c *C) {
-	t := New()
+func TestExpandLeaf(t *testing.T) {
+	a := New()
 	keys := [][]byte{
 		[]byte("abcdefghijklmn"),
 		[]byte("abcdefghijklmnopq"),
@@ -116,11 +111,11 @@ func (s *ArtSuite) TestExpandLeaf(c *C) {
 		[]byte("deanthropomorphize"),
 	}
 
-	s.putAndCheck(c, t, keys)
+	putAndCheck(t, a, keys)
 }
 
-func (s *ArtSuite) TestCompressPath(c *C) {
-	t := New()
+func TestCompressPath(t *testing.T) {
+	a := New()
 
 	k21 := []byte{2, 1}
 	k12 := []byte{1, 2}
@@ -129,233 +124,233 @@ func (s *ArtSuite) TestCompressPath(c *C) {
 	k12345 := []byte{1, 2, 3, 4, 5}
 	k12346 := []byte{1, 2, 3, 4, 6}
 
-	t.Put(k21, k21)
-	t.Put(k12, k12)
-	t.Put(k125, k125)
-	t.Put(k1237, k1237)
-	t.Put(k12345, k12345)
-	t.Put(k12346, k12346)
+	a.Put(k21, k21)
+	a.Put(k12, k12)
+	a.Put(k125, k125)
+	a.Put(k1237, k1237)
+	a.Put(k12345, k12345)
+	a.Put(k12346, k12346)
 
-	t.Delete(k1237)
-	t.Delete(k125)
+	a.Delete(k1237)
+	a.Delete(k125)
 
-	v, ok := t.Get(k12345)
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, k12345)
+	v, ok := a.Get(k12345)
+	require.True(t, ok)
+	require.Equal(t, k12345, v)
 
-	v, ok = t.Get(k12346)
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, k12346)
+	v, ok = a.Get(k12346)
+	require.True(t, ok)
+	require.Equal(t, k12346, v)
 
-	t.Delete(k21)
-	v, ok = t.Get(k12)
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, k12)
+	a.Delete(k21)
+	v, ok = a.Get(k12)
+	require.True(t, ok)
+	require.Equal(t, k12, v)
 
-	t.Delete(k12345)
-	v, ok = t.Get(k12346)
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, k12346)
+	a.Delete(k12345)
+	v, ok = a.Get(k12346)
+	require.True(t, ok)
+	require.Equal(t, k12346, v)
 
-	t.Delete(k12)
-	v, ok = t.Get(k12)
-	c.Assert(ok, IsFalse)
+	a.Delete(k12)
+	v, ok = a.Get(k12)
+	require.False(t, ok)
 
-	leaf := (*leaf)(unsafe.Pointer(t.root.firstChild()))
-	c.Assert(leaf.nodeType, Equals, uint8(typeLeaf))
-	c.Assert(leaf.key(), BytesEquals, k12346)
+	leaf := (*leaf)(unsafe.Pointer(a.root.firstChild()))
+	require.Equal(t, uint8(typeLeaf), leaf.nodeType)
+	require.Equal(t, k12346, leaf.key())
 }
 
-func (s *ArtSuite) TestGrowAndShrink(c *C) {
-	t := New()
+func TestGrowAndShrink(t *testing.T) {
+	a := New()
 	var keys [][]byte
 	for i := 0; i < 256; i++ {
 		keys = append(keys, []byte{byte(i)})
 	}
 
-	s.putAndCheck(c, t, keys[:4])
-	c.Assert(t.root.nodeType, Equals, uint8(typeNode4))
+	putAndCheck(t, a, keys[:4])
+	require.Equal(t, uint8(typeNode4), a.root.nodeType)
 
-	s.putAndCheck(c, t, keys[:16])
-	c.Assert(t.root.nodeType, Equals, uint8(typeNode16))
+	putAndCheck(t, a, keys[:16])
+	require.Equal(t, uint8(typeNode16), a.root.nodeType)
 
-	s.putAndCheck(c, t, keys[:48])
-	c.Assert(t.root.nodeType, Equals, uint8(typeNode48))
+	putAndCheck(t, a, keys[:48])
+	require.Equal(t, uint8(typeNode48), a.root.nodeType)
 
-	s.putAndCheck(c, t, keys)
-	c.Assert(t.root.nodeType, Equals, uint8(typeNode256))
+	putAndCheck(t, a, keys)
+	require.Equal(t, uint8(typeNode256), a.root.nodeType)
 
 	for i := 0; i <= 256-node256MinSize; i++ {
-		t.Delete([]byte{byte(i)})
+		a.Delete([]byte{byte(i)})
 	}
-	c.Assert(t.root.nodeType, Equals, uint8(typeNode48))
+	require.Equal(t, uint8(typeNode48), a.root.nodeType)
 
 	for i := 256 - node256MinSize + 1; i <= 256-node48MinSize; i++ {
-		t.Delete([]byte{byte(i)})
+		a.Delete([]byte{byte(i)})
 	}
-	c.Assert(t.root.nodeType, Equals, uint8(typeNode16))
+	require.Equal(t, uint8(typeNode16), a.root.nodeType)
 
 	for i := 256 - node48MinSize + 1; i <= 256-node16MinSize; i++ {
-		t.Delete([]byte{byte(i)})
+		a.Delete([]byte{byte(i)})
 	}
-	c.Assert(t.root.nodeType, Equals, uint8(typeNode4))
+	require.Equal(t, uint8(typeNode4), a.root.nodeType)
 
 	for i := 256 - node16MinSize + 1; i < 256; i++ {
-		t.Delete([]byte{byte(i)})
+		a.Delete([]byte{byte(i)})
 	}
-	c.Assert(t.root.nodeType, Equals, uint8(typeNode4))
+	require.Equal(t, uint8(typeNode4), a.root.nodeType)
 }
 
-func (s *ArtSuite) TestGetWhenPathExpand(c *C) {
+func TestGetWhenPathExpand(t *testing.T) {
 	// case 1: expand leaf node.
-	t := New()
-	t.Put([]byte{1, 2, 3, 4}, []byte{1, 2, 3, 4})
+	a := New()
+	a.Put([]byte{1, 2, 3, 4}, []byte{1, 2, 3, 4})
 	err := failpoint.Enable("github.com/bobotu/myk/art/get-before-rLock-fp", "pause")
-	c.Assert(err, IsNil)
+	require.Nil(t, err)
 	go func() {
-		s.sleep()
-		t.Put([]byte{1, 2, 3}, []byte{1, 2, 3})
+		sleep()
+		a.Put([]byte{1, 2, 3}, []byte{1, 2, 3})
 		err := failpoint.Disable("github.com/bobotu/myk/art/get-before-rLock-fp")
-		c.Assert(err, IsNil)
+		require.Nil(t, err)
 	}()
-	v, ok := t.Get([]byte{1, 2, 3})
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, []byte{1, 2, 3})
+	v, ok := a.Get([]byte{1, 2, 3})
+	require.True(t, ok)
+	require.Equal(t, []byte{1, 2, 3}, v)
 
 	// case 2: split prefix.
 	err = failpoint.Enable("github.com/bobotu/myk/art/get-before-rLock-fp", "1*return(0)->pause")
-	c.Assert(err, IsNil)
+	require.Nil(t, err)
 	go func() {
-		s.sleep()
-		t.Put([]byte{1, 2, 1, 2}, []byte{1, 2, 1, 2})
+		sleep()
+		a.Put([]byte{1, 2, 1, 2}, []byte{1, 2, 1, 2})
 		err := failpoint.Disable("github.com/bobotu/myk/art/get-before-rLock-fp")
-		c.Assert(err, IsNil)
+		require.Nil(t, err)
 	}()
-	v, ok = t.Get([]byte{1, 2, 1, 2})
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, []byte{1, 2, 1, 2})
+	v, ok = a.Get([]byte{1, 2, 1, 2})
+	require.True(t, ok)
+	require.Equal(t, []byte{1, 2, 1, 2}, v)
 
 	// case 3: split prefix and pause after prefix check. Get should handle the structure modification happened during pause.
-	t = New()
-	t.Put([]byte{1, 2, 3, 4, 5}, []byte{1, 2, 3, 4, 5})
-	t.Put([]byte{1, 2, 3, 4, 6}, []byte{1, 2, 3, 4, 6})
+	a = New()
+	a.Put([]byte{1, 2, 3, 4, 5}, []byte{1, 2, 3, 4, 5})
+	a.Put([]byte{1, 2, 3, 4, 6}, []byte{1, 2, 3, 4, 6})
 	err = failpoint.Enable("github.com/bobotu/myk/art/get-after-checkPrefix-fp", "1*return(0)->pause")
-	c.Assert(err, IsNil)
+	require.Nil(t, err)
 	go func() {
-		s.sleep()
-		t.Put([]byte{1, 2, 1, 2}, []byte{1, 2, 1, 2})
+		sleep()
+		a.Put([]byte{1, 2, 1, 2}, []byte{1, 2, 1, 2})
 		err := failpoint.Disable("github.com/bobotu/myk/art/get-after-checkPrefix-fp")
-		c.Assert(err, IsNil)
+		require.Nil(t, err)
 	}()
-	v, ok = t.Get([]byte{1, 2, 3, 4, 5})
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, []byte{1, 2, 3, 4, 5})
+	v, ok = a.Get([]byte{1, 2, 3, 4, 5})
+	require.True(t, ok)
+	require.Equal(t, []byte{1, 2, 3, 4, 5}, v)
 }
 
-func (s *ArtSuite) TestGetWhenNodeObsoleted(c *C) {
-	var t *ART
+func TestGetWhenNodeObsoleted(t *testing.T) {
+	var a *ART
 	triggerGrow := func() {
-		s.sleep()
+		sleep()
 		for i := 0; i < 5; i++ {
-			t.Put([]byte{byte(i)}, []byte{byte(i)})
+			a.Put([]byte{byte(i)}, []byte{byte(i)})
 		}
 		err := failpoint.Disable("github.com/bobotu/myk/art/get-before-rLock-fp")
-		c.Assert(err, IsNil)
+		require.Nil(t, err)
 	}
 
-	t = New()
+	a = New()
 	err := failpoint.Enable("github.com/bobotu/myk/art/get-before-rLock-fp", "pause")
-	c.Assert(err, IsNil)
+	require.Nil(t, err)
 	go triggerGrow()
 
-	v, ok := t.Get([]byte{4})
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, []byte{4})
+	v, ok := a.Get([]byte{4})
+	require.True(t, ok)
+	require.Equal(t, []byte{4}, v)
 
-	t = New()
-	t.Put([]byte{1, 2}, []byte{1, 2})
-	t.Put([]byte{1, 2, 3}, []byte{1, 2, 3})
+	a = New()
+	a.Put([]byte{1, 2}, []byte{1, 2})
+	a.Put([]byte{1, 2, 3}, []byte{1, 2, 3})
 	err = failpoint.Enable("github.com/bobotu/myk/art/get-before-rLock-fp", "1*return(0)->pause")
-	c.Assert(err, IsNil)
+	require.Nil(t, err)
 	go triggerGrow()
 
-	v, ok = t.Get([]byte{1, 2})
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, []byte{1, 2})
+	v, ok = a.Get([]byte{1, 2})
+	require.True(t, ok)
+	require.Equal(t, []byte{1, 2}, v)
 }
 
-func (s *ArtSuite) TestGetWhenNodeCompressed(c *C) {
-	var t *ART
+func TestGetWhenNodeCompressed(t *testing.T) {
+	var a *ART
 	genTree := func() *ART {
-		t := New()
+		a := New()
 		keys := [][]byte{
 			{1, 2, 3, 4, 5},
 			{1, 2, 3, 4, 6, 7},
 			{1, 2, 3, 4, 6, 8},
 		}
-		s.putAndCheck(c, t, keys)
-		return t
+		putAndCheck(t, a, keys)
+		return a
 	}
 	triggerCompress := func(fp string) {
-		s.sleep()
-		t.Delete([]byte{1, 2, 3, 4, 5})
+		sleep()
+		a.Delete([]byte{1, 2, 3, 4, 5})
 		err := failpoint.Disable(fp)
-		c.Assert(err, IsNil)
+		require.Nil(t, err)
 	}
 
 	// case 1: get will paused before check prefix, and a delete operation will compress the node at paused level.
 	// Ideally, get should detect the conflict and return the correct value.
-	t = genTree()
+	a = genTree()
 	err := failpoint.Enable("github.com/bobotu/myk/art/get-before-checkPrefix-fp", "2*return(0)->pause")
-	c.Assert(err, IsNil)
+	require.Nil(t, err)
 	go triggerCompress("github.com/bobotu/myk/art/get-before-checkPrefix-fp")
 
-	v, ok := t.Get([]byte{1, 2, 3, 4, 6, 8})
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, []byte{1, 2, 3, 4, 6, 8})
+	v, ok := a.Get([]byte{1, 2, 3, 4, 6, 8})
+	require.True(t, ok)
+	require.Equal(t, []byte{1, 2, 3, 4, 6, 8}, v)
 
 	// case 2: get will pause after check prefix, and a delete operation will compress the node at paused level.
 	// This case emulate normal node read-write conflict, get should return the correct result.
-	t = genTree()
+	a = genTree()
 	err = failpoint.Enable("github.com/bobotu/myk/art/get-after-checkPrefix-fp", "2*return(0)->pause")
-	c.Assert(err, IsNil)
+	require.Nil(t, err)
 	go triggerCompress("github.com/bobotu/myk/art/get-after-checkPrefix-fp")
 
-	v, ok = t.Get([]byte{1, 2, 3, 4, 6, 8})
-	c.Assert(ok, IsTrue)
-	c.Assert(v, BytesEquals, []byte{1, 2, 3, 4, 6, 8})
+	v, ok = a.Get([]byte{1, 2, 3, 4, 6, 8})
+	require.True(t, ok)
+	require.Equal(t, []byte{1, 2, 3, 4, 6, 8}, v)
 
 	// case 3: get with an key which doesn't exist in target tree. After get resume from failpoint
 	// the stored prefix will be updated due to path compression, and key will match with the updated prefix.
 	// In this case, get should detect this kind of incorrect match and return key not found.
-	t = genTree()
+	a = genTree()
 	err = failpoint.Enable("github.com/bobotu/myk/art/get-before-checkPrefix-fp", "2*return(0)->pause")
-	c.Assert(err, IsNil)
+	require.Nil(t, err)
 	go triggerCompress("github.com/bobotu/myk/art/get-before-checkPrefix-fp")
 
-	v, ok = t.Get([]byte{1, 2, 3, 4, 6, 2, 3, 4, 6, 8})
-	c.Assert(ok, IsFalse)
+	v, ok = a.Get([]byte{1, 2, 3, 4, 6, 2, 3, 4, 6, 8})
+	require.False(t, ok)
 }
 
-func (s *ArtSuite) TestWriteWhenPathExpand(c *C) {
+func TestWriteWhenPathExpand(t *testing.T) {
 	inTrigger := false
 	putTestCtx = failpoint.WithHook(context.Background(), func(ctx context.Context, fpname string) bool {
 		return !inTrigger
 	})
 
 	test := func(fp string) {
-		t := New()
-		t.Put([]byte{1, 2, 3, 4}, []byte{1, 2, 3, 4})
-		t.Put([]byte{1, 2, 3, 6}, []byte{1, 2, 3, 6})
+		a := New()
+		a.Put([]byte{1, 2, 3, 4}, []byte{1, 2, 3, 4})
+		a.Put([]byte{1, 2, 3, 6}, []byte{1, 2, 3, 6})
 		err := failpoint.Enable(fp, "1*return(0)->1*return(1000)->off")
-		c.Assert(err, IsNil)
+		require.Nil(t, err)
 		go func() {
-			s.sleep()
-			t.Put([]byte{1, 2, 1, 0}, []byte{1, 2, 1, 0})
+			sleep()
+			a.Put([]byte{1, 2, 1, 0}, []byte{1, 2, 1, 0})
 			err := failpoint.Disable(fp)
-			c.Assert(err, IsNil)
+			require.Nil(t, err)
 		}()
-		s.putAndCheck(c, t, [][]byte{{1, 2, 3, 5}})
+		putAndCheck(t, a, [][]byte{{1, 2, 3, 5}})
 	}
 
 	test("github.com/bobotu/myk/art/set-before-prefixMismatch-fp")
