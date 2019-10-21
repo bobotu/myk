@@ -11,10 +11,7 @@ func BenchmarkBuild(b *testing.B) {
 
 	for n := 0; n < b.N; n++ {
 		builder := NewBuilder(2, HashSuffix, 8, 0)
-		for i, k := range handles {
-			builder.Add(k, u16ToBytes(uint16(i)))
-		}
-		_ = builder.Finish(20)
+		builder.Build(handles, handles, 24)
 	}
 }
 

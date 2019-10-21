@@ -3,7 +3,6 @@ package surf
 import (
 	"bytes"
 	"io"
-	"unsafe"
 )
 
 type loudsSparse struct {
@@ -17,9 +16,10 @@ type loudsSparse struct {
 	loudsVec    selectVector
 	suffixes    suffixVector
 	values      valueVector
+	prefixVec   prefixVec
 }
 
-func (ls *loudsSparse) init(builder *Builder) *loudsSparse {
+func (ls *loudsSparse) Init(builder *Builder) *loudsSparse {
 	ls.height = uint32(len(builder.lsLabels))
 	ls.startLevel = builder.sparseStartLevel
 
@@ -31,44 +31,56 @@ func (ls *loudsSparse) init(builder *Builder) *loudsSparse {
 		ls.denseChildCount = ls.denseNodeCount + builder.nodeCounts[ls.startLevel] - 1
 	}
 
-	ls.labelVec.init(builder.lsLabels, ls.startLevel, ls.height)
+	ls.labelVec.Init(builder.lsLabels, ls.startLevel, ls.height)
 
-	numItemsPerLevel := make([]uint32, ls.height)
+	numItemsPerLevel := make([]uint32, ls.sparseLevels())
 	for level := range numItemsPerLevel {
-		numItemsPerLevel[level] = uint32(len(builder.lsLabels[level]))
+		numItemsPerLevel[level] = uint32(len(builder.lsLabels[int(ls.startLevel)+level]))
 	}
-	ls.hasChildVec.init(builder.lsHasChild, numItemsPerLevel, ls.startLevel, ls.height)
-	ls.loudsVec.init(builder.lsLoudsBits, numItemsPerLevel, ls.startLevel, ls.height)
+	ls.hasChildVec.Init(builder.lsHasChild[ls.startLevel:], numItemsPerLevel)
+	ls.loudsVec.Init(builder.lsLoudsBits[ls.startLevel:], numItemsPerLevel)
 
 	if builder.suffixType != NoneSuffix {
 		hashLen := builder.hashSuffixLen
 		realLen := builder.realSuffixLen
 		suffixLen := hashLen + realLen
-		numSuffixBitsPerLevel := make([]uint32, ls.height)
+		numSuffixBitsPerLevel := make([]uint32, ls.sparseLevels())
 		for i := range numSuffixBitsPerLevel {
-			numSuffixBitsPerLevel[i] = builder.suffixCounts[i] * suffixLen
+			numSuffixBitsPerLevel[i] = builder.suffixCounts[int(ls.startLevel)+i] * suffixLen
 		}
-		ls.suffixes.init(builder.suffixType, hashLen, realLen, builder.suffixes, numSuffixBitsPerLevel, ls.startLevel, ls.height)
+		ls.suffixes.Init(builder.suffixType, hashLen, realLen, builder.suffixes[ls.startLevel:], numSuffixBitsPerLevel)
 	}
 
-	ls.values.init(builder.values, builder.valueSize, ls.startLevel, ls.height)
+	ls.values.Init(builder.values[ls.startLevel:], builder.valueSize)
+	ls.prefixVec.Init(builder.hasPrefix[ls.startLevel:], builder.nodeCounts[ls.startLevel:], builder.prefixes[ls.startLevel:])
 
 	return ls
 }
 
-func (ls *loudsSparse) Get(key []byte, nodeID uint32) (value []byte, ok bool) {
+func (ls *loudsSparse) Get(key []byte, startDepth, nodeID uint32) (value []byte, ok bool) {
 	var (
-		pos   = ls.firstLabelPos(nodeID)
-		level uint32
+		pos       = ls.firstLabelPos(nodeID)
+		depth     uint32
+		prefixLen uint32
 	)
-	for level = ls.startLevel; level < uint32(len(key)); level++ {
-		if pos, ok = ls.labelVec.Search(key[level], pos, ls.nodeSize(pos)); !ok {
+	for depth = startDepth; depth < uint32(len(key)); depth++ {
+		prefixLen, ok = ls.prefixVec.CheckPrefix(key, depth, ls.prefixID(nodeID))
+		if !ok {
+			return nil, false
+		}
+		depth += prefixLen
+
+		if depth >= uint32(len(key)) {
+			break
+		}
+
+		if pos, ok = ls.labelVec.Search(key[depth], pos, ls.nodeSize(pos)); !ok {
 			return nil, false
 		}
 
 		if !ls.hasChildVec.IsSet(pos) {
 			valPos := ls.suffixPos(pos)
-			if ok = ls.suffixes.CheckEquality(valPos, key, level+1); ok {
+			if ok = ls.suffixes.CheckEquality(valPos, key, depth+1); ok {
 				value = ls.values.Get(valPos)
 			}
 			return value, ok
@@ -80,7 +92,7 @@ func (ls *loudsSparse) Get(key []byte, nodeID uint32) (value []byte, ok bool) {
 
 	if ls.labelVec.GetLabel(pos) == labelTerminator && !ls.hasChildVec.IsSet(pos) {
 		valPos := ls.suffixPos(pos)
-		if ok = ls.suffixes.CheckEquality(valPos, key, level+1); ok {
+		if ok = ls.suffixes.CheckEquality(valPos, key, depth+1); ok {
 			value = ls.values.Get(valPos)
 		}
 		return value, ok
@@ -89,17 +101,12 @@ func (ls *loudsSparse) Get(key []byte, nodeID uint32) (value []byte, ok bool) {
 	return nil, false
 }
 
-func (ls *loudsSparse) MemSize() uint32 {
-	return uint32(unsafe.Sizeof(*ls)) + ls.labelVec.MemSize() +
-		ls.hasChildVec.MemSize() + ls.loudsVec.MemSize() + ls.suffixes.MemSize()
-}
-
 func (ls *loudsSparse) MarshalSize() int64 {
 	return align(ls.rawMarshalSize())
 }
 
 func (ls *loudsSparse) rawMarshalSize() int64 {
-	return 4*4 + ls.labelVec.MarshalSize() + ls.hasChildVec.MarshalSize() + ls.loudsVec.MarshalSize() + ls.suffixes.MarshalSize()
+	return 4*4 + ls.labelVec.MarshalSize() + ls.hasChildVec.MarshalSize() + ls.loudsVec.MarshalSize() + ls.suffixes.MarshalSize() + ls.prefixVec.MarshalSize()
 }
 
 func (ls *loudsSparse) WriteTo(w io.Writer) error {
@@ -132,6 +139,9 @@ func (ls *loudsSparse) WriteTo(w io.Writer) error {
 	if err := ls.suffixes.WriteTo(w); err != nil {
 		return err
 	}
+	if err := ls.prefixVec.WriteTo(w); err != nil {
+		return err
+	}
 
 	padding := ls.MarshalSize() - ls.rawMarshalSize()
 	var zeros [8]byte
@@ -154,6 +164,7 @@ func (ls *loudsSparse) Unmarshal(buf []byte) []byte {
 	buf1 = ls.hasChildVec.Unmarshal(buf1)
 	buf1 = ls.loudsVec.Unmarshal(buf1)
 	buf1 = ls.suffixes.Unmarshal(buf1)
+	buf1 = ls.prefixVec.Unmarshal(buf1)
 
 	sz := align(int64(len(buf) - len(buf1)))
 	return buf[sz:]
@@ -165,6 +176,13 @@ func (ls *loudsSparse) suffixPos(pos uint32) uint32 {
 
 func (ls *loudsSparse) firstLabelPos(nodeID uint32) uint32 {
 	return ls.loudsVec.Select(nodeID + 1 - ls.denseNodeCount)
+}
+
+func (ls *loudsSparse) sparseLevels() uint32 {
+	return ls.height - ls.startLevel
+}
+func (ls *loudsSparse) prefixID(nodeID uint32) uint32 {
+	return nodeID - ls.denseNodeCount
 }
 
 func (ls *loudsSparse) lastLabelPos(nodeID uint32) uint32 {
@@ -193,87 +211,125 @@ type sparseIter struct {
 	ls           *loudsSparse
 	startLevel   uint32
 	startNodeID  uint32
-	keyLen       uint32
+	startDepth   uint32
+	level        uint32
 	keyBuf       []byte
 	posInTrie    []uint32
+	nodeID       []uint32
+	prefixLen    []uint32
 }
 
-func (it *sparseIter) init(ls *loudsSparse) {
+func (it *sparseIter) Init(ls *loudsSparse) {
 	it.ls = ls
 	it.startLevel = ls.startLevel
-	it.keyBuf = make([]byte, ls.height-ls.startLevel)
 	it.posInTrie = make([]uint32, ls.height-ls.startLevel)
+	it.prefixLen = make([]uint32, ls.height-ls.startLevel)
+	it.nodeID = make([]uint32, ls.height-ls.startLevel)
 }
 
-func (it *sparseIter) next() {
+func (it *sparseIter) Next() {
 	it.atTerminator = false
-	pos := it.posInTrie[it.keyLen-1] + 1
+	pos := it.posInTrie[it.level] + 1
+	nodeID := it.nodeID[it.level]
 
 	for pos >= it.ls.loudsVec.numBits || it.ls.loudsVec.IsSet(pos) {
-		it.keyLen--
-		if it.keyLen == 0 {
+		if it.level == 0 {
 			it.valid = false
+			it.keyBuf = it.keyBuf[:0]
 			return
 		}
-		pos = it.posInTrie[it.keyLen-1] + 1
+		it.level--
+		pos = it.posInTrie[it.level] + 1
+		nodeID = it.nodeID[it.level]
 	}
-	it.set(it.keyLen-1, pos)
-	it.moveToLeftMostKey()
+	it.setAt(it.level, pos, nodeID)
+	it.MoveToLeftMostKey()
 }
 
-func (it *sparseIter) prev() {
+func (it *sparseIter) Prev() {
 	it.atTerminator = false
-	pos := it.posInTrie[it.keyLen-1]
+	pos := it.posInTrie[it.level]
+	nodeID := it.nodeID[it.level]
+
 	if pos == 0 {
 		it.valid = false
 		return
 	}
-
 	for it.ls.loudsVec.IsSet(pos) {
-		it.keyLen--
-		if it.keyLen == 0 {
+		if it.level == 0 {
 			it.valid = false
+			it.keyBuf = it.keyBuf[:0]
 			return
 		}
-		pos = it.posInTrie[it.keyLen-1]
+		it.level--
+		pos = it.posInTrie[it.level]
+		nodeID = it.nodeID[it.level]
 	}
-	it.set(it.keyLen-1, pos-1)
-	it.moveToRightMostKey()
+	it.setAt(it.level, pos-1, nodeID)
+	it.MoveToRightMostKey()
 }
 
-func (it *sparseIter) seek(key []byte) bool {
+func (it *sparseIter) Seek(key []byte) bool {
 	nodeID := it.startNodeID
 	pos := it.ls.firstLabelPos(nodeID)
 	var ok bool
-	var level uint32
+	depth := it.startDepth
 
-	for level = it.startLevel; level < uint32(len(key)); level++ {
-		nodeSize := it.ls.nodeSize(pos)
-		pos, ok = it.ls.labelVec.Search(key[level], pos, nodeSize)
-		if !ok {
-			it.moveToLeftInNextSubTrie(pos, nodeSize, key[level])
+	for it.level = 0; it.level < it.ls.sparseLevels(); it.level++ {
+		prefix := it.ls.prefixVec.GetPrefix(it.ls.prefixID(nodeID))
+		var prefixCmp int
+		if len(prefix) != 0 {
+			end := int(depth) + len(prefix)
+			if end > len(key) {
+				end = len(key)
+			}
+			prefixCmp = bytes.Compare(prefix, key[depth:end])
+		}
+
+		if prefixCmp < 0 {
+			if it.level == 0 {
+				it.valid = false
+				return false
+			}
+			it.level--
+			it.Next()
 			return false
 		}
 
-		it.append(key[level], pos)
+		depth += uint32(len(prefix))
+		if depth >= uint32(len(key)) || prefixCmp > 0 {
+			it.append(it.ls.labelVec.GetLabel(pos), pos, nodeID)
+			it.MoveToLeftMostKey()
+			return false
+		}
+
+		nodeSize := it.ls.nodeSize(pos)
+		pos, ok = it.ls.labelVec.Search(key[depth], pos, nodeSize)
+		if !ok {
+			it.moveToLeftInNextSubTrie(pos, nodeID, nodeSize, key[depth])
+			return false
+		}
+
+		it.append(key[depth], pos, nodeID)
 
 		if !it.ls.hasChildVec.IsSet(pos) {
-			return it.compareSuffixGreaterThan(key, pos, level+1)
+			return it.compareSuffixGreaterThan(key, pos, depth+1)
 		}
 
 		nodeID = it.ls.childNodeID(pos)
 		pos = it.ls.firstLabelPos(nodeID)
+		depth++
 	}
 
 	if it.ls.labelVec.GetLabel(pos) == labelTerminator && !it.ls.hasChildVec.IsSet(pos) && !it.ls.isEndOfNode(pos) {
-		it.append(labelTerminator, pos)
+		it.append(labelTerminator, pos, nodeID)
 		it.atTerminator = true
 		it.valid = true
 		return false
 	}
 
-	if uint32(len(key)) <= level {
-		it.moveToLeftMostKey()
+	if uint32(len(key)) <= depth {
+		it.MoveToLeftMostKey()
 		return false
 	}
 
@@ -281,45 +337,52 @@ func (it *sparseIter) seek(key []byte) bool {
 	return true
 }
 
-func (it *sparseIter) key() []byte {
-	l := it.keyLen
+func (it *sparseIter) Key() []byte {
 	if it.atTerminator {
-		l--
+		return it.keyBuf[:len(it.keyBuf)-1]
 	}
-	return it.keyBuf[:l]
+	return it.keyBuf
 }
 
-func (it *sparseIter) value() []byte {
-	valPos := it.ls.suffixPos(it.posInTrie[it.keyLen-1])
+func (it *sparseIter) Value() []byte {
+	valPos := it.ls.suffixPos(it.posInTrie[it.level])
 	return it.ls.values.Get(valPos)
 }
 
-func (it *sparseIter) reset() {
+func (it *sparseIter) Compare(key []byte) int {
+	itKey := it.Key()
+	if it.atTerminator && uint32(len(itKey)) < (uint32(len(key))-it.startDepth) {
+		return -1
+	}
+	if it.startDepth >= uint32(len(key)) {
+		return 1
+	}
+	if len(itKey) > len(key[it.startDepth:]) {
+		return 1
+	}
+	cmp := bytes.Compare(itKey, key[it.startDepth:it.startDepth+uint32(len(itKey))])
+	if cmp != 0 {
+		return cmp
+	}
+	suffixPos := it.ls.suffixPos(it.posInTrie[it.level])
+	return it.ls.suffixes.Compare(key[it.startDepth:], suffixPos, uint32(len(itKey)))
+}
+
+func (it *sparseIter) Reset() {
 	it.valid = false
-	it.keyLen = 0
+	it.level = 0
 	it.atTerminator = false
+	it.keyBuf = it.keyBuf[:0]
 }
 
-func (it *sparseIter) append(label byte, pos uint32) {
-	it.keyBuf[it.keyLen] = label
-	it.posInTrie[it.keyLen] = pos
-	it.keyLen++
-}
-
-func (it *sparseIter) set(level, pos uint32) {
-	it.keyBuf[level] = it.ls.labelVec.GetLabel(pos)
-	it.posInTrie[level] = pos
-}
-
-func (it *sparseIter) moveToLeftMostKey() {
-	if it.keyLen == 0 {
+func (it *sparseIter) MoveToLeftMostKey() {
+	if len(it.keyBuf) == 0 {
 		pos := it.ls.firstLabelPos(it.startNodeID)
 		label := it.ls.labelVec.GetLabel(pos)
-		it.append(label, pos)
+		it.append(label, pos, it.startNodeID)
 	}
 
-	level := it.keyLen - 1
-	pos := it.posInTrie[level]
+	pos := it.posInTrie[it.level]
 	label := it.ls.labelVec.GetLabel(pos)
 
 	if !it.ls.hasChildVec.IsSet(pos) {
@@ -330,34 +393,33 @@ func (it *sparseIter) moveToLeftMostKey() {
 		return
 	}
 
-	for level < it.ls.height {
+	for it.level < it.ls.sparseLevels() {
+		it.level++
 		nodeID := it.ls.childNodeID(pos)
 		pos = it.ls.firstLabelPos(nodeID)
 		label = it.ls.labelVec.GetLabel(pos)
 
 		if !it.ls.hasChildVec.IsSet(pos) {
-			it.append(label, pos)
+			it.append(label, pos, nodeID)
 			if label == labelTerminator && !it.ls.isEndOfNode(pos) {
 				it.atTerminator = true
 			}
 			it.valid = true
 			return
 		}
-		it.append(label, pos)
-		level++
+		it.append(label, pos, nodeID)
 	}
 	panic("unreachable")
 }
 
-func (it *sparseIter) moveToRightMostKey() {
-	if it.keyLen == 0 {
+func (it *sparseIter) MoveToRightMostKey() {
+	if len(it.keyBuf) == 0 {
 		pos := it.ls.lastLabelPos(it.startNodeID)
 		label := it.ls.labelVec.GetLabel(pos)
-		it.append(label, pos)
+		it.append(label, pos, it.startNodeID)
 	}
 
-	level := it.keyLen - 1
-	pos := it.posInTrie[level]
+	pos := it.posInTrie[it.level]
 	label := it.ls.labelVec.GetLabel(pos)
 
 	if !it.ls.hasChildVec.IsSet(pos) {
@@ -368,70 +430,72 @@ func (it *sparseIter) moveToRightMostKey() {
 		return
 	}
 
-	for level < it.ls.height {
+	for it.level < it.ls.sparseLevels() {
+		it.level++
 		nodeID := it.ls.childNodeID(pos)
 		pos = it.ls.lastLabelPos(nodeID)
 		label = it.ls.labelVec.GetLabel(pos)
 
 		if !it.ls.hasChildVec.IsSet(pos) {
-			it.append(label, pos)
+			it.append(label, pos, nodeID)
 			if label == labelTerminator && !it.ls.isEndOfNode(pos) {
 				it.atTerminator = true
 			}
 			it.valid = true
 			return
 		}
-		it.append(label, pos)
-		level++
+		it.append(label, pos, nodeID)
 	}
 	panic("unreachable")
 }
 
-func (it *sparseIter) setToFirstInRoot() {
+func (it *sparseIter) SetToFirstInRoot() {
 	it.posInTrie[0] = 0
-	it.keyBuf[0] = it.ls.labelVec.GetLabel(0)
+	it.keyBuf = append(it.keyBuf[:0], it.ls.labelVec.GetLabel(0))
 }
 
-func (it *sparseIter) setToLastInRoot() {
+func (it *sparseIter) SetToLastInRoot() {
 	it.posInTrie[0] = it.ls.lastLabelPos(0)
-	it.keyBuf[0] = it.ls.labelVec.GetLabel(it.posInTrie[0])
+	it.keyBuf = append(it.keyBuf[:0], it.ls.labelVec.GetLabel(it.posInTrie[0]))
 }
 
-func (it *sparseIter) moveToLeftInNextSubTrie(pos, nodeSize uint32, label byte) {
+func (it *sparseIter) append(label byte, pos, nodeID uint32) {
+	prefix := it.ls.prefixVec.GetPrefix(it.ls.prefixID(nodeID))
+	it.keyBuf = append(it.keyBuf, prefix...)
+	it.keyBuf = append(it.keyBuf, label)
+	it.posInTrie[it.level] = pos
+	it.prefixLen[it.level] = uint32(len(prefix)) + 1
+	if it.level != 0 {
+		it.prefixLen[it.level] += it.prefixLen[it.level-1]
+	}
+	it.nodeID[it.level] = nodeID
+}
+
+func (it *sparseIter) setAt(level, pos, nodeID uint32) {
+	it.keyBuf = append(it.keyBuf[:it.prefixLen[level]-1], it.ls.labelVec.GetLabel(pos))
+	it.posInTrie[it.level] = pos
+}
+
+func (it *sparseIter) truncate(level uint32) {
+	it.keyBuf = it.keyBuf[:it.prefixLen[level]]
+}
+
+func (it *sparseIter) moveToLeftInNextSubTrie(pos, nodeID, nodeSize uint32, label byte) {
 	pos, ok := it.ls.labelVec.SearchGreaterThan(label, pos, nodeSize)
-	it.append(it.ls.labelVec.GetLabel(pos), pos)
+	it.append(it.ls.labelVec.GetLabel(pos), pos, nodeID)
 	if ok {
-		it.moveToLeftMostKey()
+		it.MoveToLeftMostKey()
 	} else {
-		it.next()
+		it.Next()
 	}
 }
 
 func (it *sparseIter) compareSuffixGreaterThan(key []byte, pos, level uint32) bool {
 	cmp := it.ls.suffixes.Compare(key, it.ls.suffixPos(pos), level)
 	if cmp < 0 {
-		it.next()
+		it.Next()
 		return false
 	}
 	it.valid = true
 	return cmp == couldBePositive
-}
-
-func (it *sparseIter) compare(key []byte) int {
-	if it.atTerminator && (it.keyLen-1) < (uint32(len(key))-it.startLevel) {
-		return -1
-	}
-	if it.startLevel >= uint32(len(key)) {
-		return 1
-	}
-	itKey := it.key()
-	if len(itKey) > len(key[it.startLevel:]) {
-		return 1
-	}
-	cmp := bytes.Compare(itKey, key[it.startLevel:it.startLevel+uint32(len(itKey))])
-	if cmp != 0 {
-		return cmp
-	}
-	suffixPos := it.ls.suffixPos(it.posInTrie[it.keyLen-1])
-	return it.ls.suffixes.Compare(key[it.startLevel:], suffixPos, it.keyLen)
 }

@@ -3,7 +3,6 @@ package surf
 import (
 	"bytes"
 	"io"
-	"unsafe"
 )
 
 const (
@@ -17,23 +16,23 @@ type loudsDense struct {
 	isPrefixVec rankVectorDense
 	suffixes    suffixVector
 	values      valueVector
+	prefixVec   prefixVec
 
 	// height is dense end level.
 	height uint32
 }
 
-func (ld *loudsDense) init(builder *Builder) *loudsDense {
+func (ld *loudsDense) Init(builder *Builder) *loudsDense {
 	ld.height = builder.sparseStartLevel
 
-	numBitsPerLevel := make([]uint32, 0, ld.height)
-	for level := 0; uint32(level) < ld.height; level++ {
-		n := len(builder.ldLabels[level]) * wordSize
-		numBitsPerLevel = append(numBitsPerLevel, uint32(n))
+	numBitsPerLevel := make([]uint32, ld.height)
+	for level := range numBitsPerLevel {
+		numBitsPerLevel[level] = uint32(len(builder.ldLabels[level]) * wordSize)
 	}
 
-	ld.labelVec.init(builder.ldLabels, numBitsPerLevel, 0, ld.height)
-	ld.hasChildVec.init(builder.ldHasChild, numBitsPerLevel, 0, ld.height)
-	ld.isPrefixVec.init(builder.ldIsPrefix, builder.nodeCounts, 0, ld.height)
+	ld.labelVec.Init(builder.ldLabels[:ld.height], numBitsPerLevel)
+	ld.hasChildVec.Init(builder.ldHasChild[:ld.height], numBitsPerLevel)
+	ld.isPrefixVec.Init(builder.ldIsPrefix[:ld.height], builder.nodeCounts)
 
 	if builder.suffixType != NoneSuffix {
 		hashLen := builder.hashSuffixLen
@@ -43,51 +42,53 @@ func (ld *loudsDense) init(builder *Builder) *loudsDense {
 		for i := range numSuffixBitsPerLevel {
 			numSuffixBitsPerLevel[i] = builder.suffixCounts[i] * suffixLen
 		}
-		ld.suffixes.init(builder.suffixType, hashLen, realLen, builder.suffixes, numSuffixBitsPerLevel, 0, ld.height)
+		ld.suffixes.Init(builder.suffixType, hashLen, realLen, builder.suffixes[:ld.height], numSuffixBitsPerLevel)
 	}
 
-	ld.values.init(builder.values, builder.valueSize, 0, ld.height)
+	ld.values.Init(builder.values[:ld.height], builder.valueSize)
+	ld.prefixVec.Init(builder.hasPrefix[:ld.height], builder.nodeCounts[:ld.height], builder.prefixes[:ld.height])
 
 	return ld
 }
 
-func (ld *loudsDense) Get(key []byte) (sparseNode int64, value []byte, ok bool) {
-	var nodeID, pos, level uint32
-	for level = 0; level < ld.height; level++ {
+func (ld *loudsDense) Get(key []byte) (sparseNode int64, depth uint32, value []byte, ok bool) {
+	var nodeID, pos uint32
+	for level := uint32(0); level < ld.height; level++ {
+		prefixLen, ok := ld.prefixVec.CheckPrefix(key, depth, nodeID)
+		if !ok {
+			return -1, depth, nil, false
+		}
+		depth += prefixLen
+
 		pos = nodeID * denseFanout
-		if level >= uint32(len(key)) {
+		if depth >= uint32(len(key)) {
 			if ld.isPrefixVec.IsSet(nodeID) {
 				valPos := ld.suffixPos(pos, true)
-				if ok = ld.suffixes.CheckEquality(valPos, key, level+1); ok {
+				if ok = ld.suffixes.CheckEquality(valPos, key, depth+1); ok {
 					value = ld.values.Get(valPos)
 				}
 			}
-			return -1, value, ok
+			return -1, depth, value, ok
 		}
-		pos += uint32(key[level])
+		pos += uint32(key[depth])
 
 		if !ld.labelVec.IsSet(pos) {
-			return -1, nil, false
+			return -1, depth, nil, false
 		}
 
 		if !ld.hasChildVec.IsSet(pos) {
 			valPos := ld.suffixPos(pos, false)
-			if ok = ld.suffixes.CheckEquality(valPos, key, level+1); ok {
+			if ok = ld.suffixes.CheckEquality(valPos, key, depth+1); ok {
 				value = ld.values.Get(valPos)
-
 			}
-			return -1, value, ok
+			return -1, depth, value, ok
 		}
 
 		nodeID = ld.childNodeID(pos)
+		depth++
 	}
 
-	return int64(nodeID), nil, true
-}
-
-func (ld *loudsDense) MemSize() uint32 {
-	return uint32(unsafe.Sizeof(*ld)) + ld.labelVec.MemSize() +
-		ld.hasChildVec.MemSize() + ld.isPrefixVec.MemSize() + ld.suffixes.MemSize()
+	return int64(nodeID), depth, nil, true
 }
 
 func (ld *loudsDense) MarshalSize() int64 {
@@ -95,7 +96,7 @@ func (ld *loudsDense) MarshalSize() int64 {
 }
 
 func (ld *loudsDense) rawMarshalSize() int64 {
-	return 4 + ld.labelVec.MarshalSize() + ld.hasChildVec.MarshalSize() + ld.isPrefixVec.MarshalSize() + ld.suffixes.MarshalSize()
+	return 4 + ld.labelVec.MarshalSize() + ld.hasChildVec.MarshalSize() + ld.isPrefixVec.MarshalSize() + ld.suffixes.MarshalSize() + ld.prefixVec.MarshalSize()
 }
 
 func (ld *loudsDense) WriteTo(w io.Writer) error {
@@ -117,6 +118,9 @@ func (ld *loudsDense) WriteTo(w io.Writer) error {
 	if err := ld.suffixes.WriteTo(w); err != nil {
 		return err
 	}
+	if err := ld.prefixVec.WriteTo(w); err != nil {
+		return err
+	}
 
 	padding := ld.MarshalSize() - ld.rawMarshalSize()
 	var zeros [8]byte
@@ -131,6 +135,7 @@ func (ld *loudsDense) Unmarshal(buf []byte) []byte {
 	buf1 = ld.hasChildVec.Unmarshal(buf1)
 	buf1 = ld.isPrefixVec.Unmarshal(buf1)
 	buf1 = ld.suffixes.Unmarshal(buf1)
+	buf1 = ld.prefixVec.Unmarshal(buf1)
 
 	sz := align(int64(len(buf) - len(buf1)))
 	return buf[sz:]
@@ -171,47 +176,62 @@ type denseIter struct {
 	rightComp     bool
 	ld            *loudsDense
 	sendOutNodeID uint32
-	keyLen        uint32
+	sendOutDepth  uint32
 	keyBuf        []byte
+	level         uint32
 	posInTrie     []uint32
+	prefixLen     []uint32
 	atPrefixKey   bool
 }
 
-func (it *denseIter) next() {
+func (it *denseIter) Init(ld *loudsDense) {
+	it.ld = ld
+	it.posInTrie = make([]uint32, ld.height)
+	it.prefixLen = make([]uint32, ld.height)
+}
+
+func (it *denseIter) Reset() {
+	it.valid = false
+	it.level = 0
+	it.atPrefixKey = false
+	it.keyBuf = it.keyBuf[:0]
+}
+
+func (it *denseIter) Next() {
 	if it.ld.height == 0 {
 		return
 	}
 	if it.atPrefixKey {
 		it.atPrefixKey = false
-		it.moveToLeftMostKey()
+		it.MoveToLeftMostKey()
 		return
 	}
 
-	pos := it.posInTrie[it.keyLen-1]
+	pos := it.posInTrie[it.level]
 	nextPos := it.ld.nextPos(pos)
 
-	for nextPos/denseFanout > pos/denseFanout {
-		it.keyLen--
-		if it.keyLen == 0 {
+	for pos == nextPos || nextPos/denseFanout > pos/denseFanout {
+		if it.level == 0 {
 			it.valid = false
 			return
 		}
-		pos = it.posInTrie[it.keyLen-1]
+		it.level--
+		pos = it.posInTrie[it.level]
 		nextPos = it.ld.nextPos(pos)
 	}
-	it.set(it.keyLen-1, nextPos)
-	it.moveToLeftMostKey()
+	it.setAt(it.level, nextPos)
+	it.MoveToLeftMostKey()
 }
 
-func (it *denseIter) prev() {
+func (it *denseIter) Prev() {
 	if it.ld.height == 0 {
 		return
 	}
 	if it.atPrefixKey {
 		it.atPrefixKey = false
-		it.keyLen--
+		it.level--
 	}
-	pos := it.posInTrie[it.keyLen-1]
+	pos := it.posInTrie[it.level]
 	prevPos, out := it.ld.prevPos(pos)
 	if out {
 		it.valid = false
@@ -221,111 +241,142 @@ func (it *denseIter) prev() {
 	for prevPos/denseFanout < pos/denseFanout {
 		nodeID := pos / denseFanout
 		if it.ld.isPrefixVec.IsSet(nodeID) {
+			it.truncate(it.level)
 			it.atPrefixKey = true
 			it.valid, it.searchComp, it.leftComp, it.rightComp = true, true, true, true
 			return
 		}
 
-		it.keyLen--
-		if it.keyLen == 0 {
+		if it.level == 0 {
 			it.valid = false
 			return
 		}
-		pos = it.posInTrie[it.keyLen-1]
+		it.level--
+		pos = it.posInTrie[it.level]
 		prevPos, out = it.ld.prevPos(pos)
 		if out {
 			it.valid = false
 			return
 		}
 	}
-	it.set(it.keyLen-1, prevPos)
-	it.moveToRightMostKey()
+	it.setAt(it.level, prevPos)
+	it.MoveToRightMostKey()
 }
 
-func (it *denseIter) seek(key []byte) bool {
-	var nodeID, pos uint32
-	for level := uint32(0); level < it.ld.height; level++ {
+func (it *denseIter) Seek(key []byte) bool {
+	var nodeID, pos, depth uint32
+	for it.level = 0; it.level < it.ld.height; it.level++ {
+		prefix := it.ld.prefixVec.GetPrefix(nodeID)
+		var prefixCmp int
+		if len(prefix) != 0 {
+			end := int(depth) + len(prefix)
+			if end > len(key) {
+				end = len(key)
+			}
+			prefixCmp = bytes.Compare(prefix, key[depth:end])
+		}
+
+		if prefixCmp < 0 {
+			if it.level == 0 {
+				it.valid = false
+				return false
+			}
+			it.level--
+			it.Next()
+			return false
+		}
+
 		pos = nodeID * denseFanout
-		if level >= uint32(len(key)) {
+		depth += uint32(len(prefix))
+		if depth >= uint32(len(key)) || prefixCmp > 0 {
 			it.append(it.ld.nextPos(pos - 1))
 			if it.ld.isPrefixVec.IsSet(nodeID) {
 				it.atPrefixKey = true
 			} else {
-				it.moveToLeftMostKey()
+				it.MoveToLeftMostKey()
 			}
 			it.valid, it.searchComp, it.leftComp, it.rightComp = true, true, true, true
-			return true
+			return prefixCmp <= 0
 		}
 
-		pos += uint32(key[level])
+		pos += uint32(key[depth])
 		it.append(pos)
+		depth++
 
 		if !it.ld.labelVec.IsSet(pos) {
-			it.next()
+			it.Next()
 			return false
 		}
 
 		if !it.ld.hasChildVec.IsSet(pos) {
-			return it.compareSuffixGreaterThan(key, pos, level+1)
+			return it.compareSuffixGreaterThan(key, pos, depth)
 		}
 
 		nodeID = it.ld.childNodeID(pos)
 	}
 
 	it.sendOutNodeID = nodeID
+	it.sendOutDepth = depth
 	it.valid, it.searchComp, it.leftComp, it.rightComp = true, false, true, true
 	return true
 }
 
-func (it *denseIter) key() []byte {
-	l := it.keyLen
+func (it *denseIter) Key() []byte {
 	if it.atPrefixKey {
-		l--
+		return it.keyBuf[:len(it.keyBuf)-1]
 	}
-	return it.keyBuf[:l]
+	return it.keyBuf
 }
 
-func (it *denseIter) value() []byte {
-	valPos := it.ld.suffixPos(it.posInTrie[it.keyLen-1], it.atPrefixKey)
+func (it *denseIter) Value() []byte {
+	valPos := it.ld.suffixPos(it.posInTrie[it.level], it.atPrefixKey)
 	return it.ld.values.Get(valPos)
 }
 
-func (it *denseIter) isComplete() bool {
+func (it *denseIter) Compare(key []byte) int {
+	itKey := it.Key()
+	if it.atPrefixKey && len(itKey) < len(key) {
+		return -1
+	}
+	if len(itKey) > len(key) {
+		return 1
+	}
+	cmp := bytes.Compare(itKey, key[:len(itKey)])
+	if cmp != 0 {
+		return cmp
+	}
+	if it.IsComplete() {
+		suffixPos := it.ld.suffixPos(it.posInTrie[it.level], it.atPrefixKey)
+		return it.ld.suffixes.Compare(key, suffixPos, uint32(len(itKey)))
+	}
+	return cmp
+}
+
+func (it *denseIter) IsComplete() bool {
 	return it.searchComp && (it.leftComp && it.rightComp)
 }
 
-func (it *denseIter) init(ld *loudsDense) {
-	it.ld = ld
-	it.keyBuf = make([]byte, ld.height)
-	it.posInTrie = make([]uint32, ld.height)
-}
-
-func (it *denseIter) reset() {
-	it.valid = false
-	it.keyLen = 0
-	it.atPrefixKey = false
-}
-
 func (it *denseIter) append(pos uint32) {
-	it.keyBuf[it.keyLen] = byte(pos % denseFanout)
-	it.posInTrie[it.keyLen] = pos
-	it.keyLen++
+	nodeID := pos / denseFanout
+	prefix := it.ld.prefixVec.GetPrefix(nodeID)
+	it.keyBuf = append(it.keyBuf, prefix...)
+	it.keyBuf = append(it.keyBuf, byte(pos%denseFanout))
+	it.posInTrie[it.level] = pos
+	it.prefixLen[it.level] = uint32(len(prefix)) + 1
+	if it.level != 0 {
+		it.prefixLen[it.level] += it.prefixLen[it.level-1]
+	}
 }
 
-func (it *denseIter) set(level, pos uint32) {
-	it.keyBuf[level] = byte(pos % denseFanout)
-	it.posInTrie[level] = pos
-}
-
-func (it *denseIter) moveToLeftMostKey() {
-	level := it.keyLen - 1
-	pos := it.posInTrie[level]
+func (it *denseIter) MoveToLeftMostKey() {
+	pos := it.posInTrie[it.level]
 	if !it.ld.hasChildVec.IsSet(pos) {
 		it.valid, it.searchComp, it.leftComp, it.rightComp = true, true, true, true
 		return
 	}
 
-	for level < it.ld.height-1 {
+	for it.level < it.ld.height-1 {
+		it.level++
 		nodeID := it.ld.childNodeID(pos)
 		if it.ld.isPrefixVec.IsSet(nodeID) {
 			it.append(it.ld.nextPos(nodeID*denseFanout - 1))
@@ -342,23 +393,22 @@ func (it *denseIter) moveToLeftMostKey() {
 			it.valid, it.searchComp, it.leftComp, it.rightComp = true, true, true, true
 			return
 		}
-
-		level++
 	}
 	it.sendOutNodeID = it.ld.childNodeID(pos)
+	it.sendOutDepth = uint32(len(it.keyBuf))
 	it.valid, it.searchComp, it.leftComp, it.rightComp = true, true, false, true
 }
 
-func (it *denseIter) moveToRightMostKey() {
-	level := it.keyLen - 1
-	pos := it.posInTrie[level]
+func (it *denseIter) MoveToRightMostKey() {
+	pos := it.posInTrie[it.level]
 	if !it.ld.hasChildVec.IsSet(pos) {
 		it.valid, it.searchComp, it.leftComp, it.rightComp = true, true, true, true
 		return
 	}
 
 	var out bool
-	for level < it.ld.height-1 {
+	for it.level < it.ld.height-1 {
+		it.level++
 		nodeID := it.ld.childNodeID(pos)
 		pos, out = it.ld.prevPos((nodeID + 1) * denseFanout)
 		if out {
@@ -372,55 +422,40 @@ func (it *denseIter) moveToRightMostKey() {
 			it.valid, it.searchComp, it.leftComp, it.rightComp = true, true, true, true
 			return
 		}
-
-		level++
 	}
 	it.sendOutNodeID = it.ld.childNodeID(pos)
+	it.sendOutDepth = uint32(len(it.keyBuf))
 	it.valid, it.searchComp, it.leftComp, it.rightComp = true, true, true, false
 }
 
-func (it *denseIter) setToFirstInRoot() {
+func (it *denseIter) SetToFirstInRoot() {
 	if it.ld.labelVec.IsSet(0) {
-		it.posInTrie[0] = 0
-		it.keyBuf[0] = 0
+		it.append(0)
 	} else {
-		it.posInTrie[0] = it.ld.nextPos(0)
-		it.keyBuf[0] = byte(it.posInTrie[0])
+		it.append(it.ld.nextPos(0))
 	}
-	it.keyLen++
 }
 
-func (it *denseIter) setToLastInRoot() {
-	it.posInTrie[0], _ = it.ld.prevPos(denseFanout)
-	it.keyBuf[0] = byte(it.posInTrie[0])
-	it.keyLen++
+func (it *denseIter) SetToLastInRoot() {
+	pos, _ := it.ld.prevPos(denseFanout)
+	it.append(pos)
+}
+
+func (it *denseIter) setAt(level, pos uint32) {
+	it.keyBuf = append(it.keyBuf[:it.prefixLen[level]-1], byte(pos%denseFanout))
+	it.posInTrie[it.level] = pos
+}
+
+func (it *denseIter) truncate(level uint32) {
+	it.keyBuf = it.keyBuf[:it.prefixLen[level]]
 }
 
 func (it *denseIter) compareSuffixGreaterThan(key []byte, pos, level uint32) bool {
 	cmp := it.ld.suffixes.Compare(key, it.ld.suffixPos(pos, false), level)
 	if cmp < 0 {
-		it.next()
+		it.Next()
 		return false
 	}
 	it.valid, it.searchComp, it.leftComp, it.rightComp = true, true, true, true
 	return cmp == couldBePositive
-}
-
-func (it *denseIter) compare(key []byte) int {
-	if it.atPrefixKey && (it.keyLen-1) < uint32(len(key)) {
-		return -1
-	}
-	itKey := it.key()
-	if len(itKey) > len(key) {
-		return 1
-	}
-	cmp := bytes.Compare(itKey, key[:len(itKey)])
-	if cmp != 0 {
-		return cmp
-	}
-	if it.isComplete() {
-		suffixPos := it.ld.suffixPos(it.posInTrie[it.keyLen-1], it.atPrefixKey)
-		return it.ld.suffixes.Compare(key, suffixPos, it.keyLen)
-	}
-	return cmp
 }

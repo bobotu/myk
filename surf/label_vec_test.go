@@ -14,7 +14,7 @@ func TestLabelVecSearch(t *testing.T) {
 		{labelTerminator, 7, 8, 9},
 	}
 	v := new(labelVector)
-	v.init(labels, 0, uint32(len(labels)))
+	v.Init(labels, 0, uint32(len(labels)))
 	labelShouldExist(t, v, 1, 0, 1, 0)
 	labelShouldExist(t, v, 3, 0, 5, 2)
 	labelShouldExist(t, v, 5, 3, 7, 4)

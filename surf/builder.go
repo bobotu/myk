@@ -1,10 +1,5 @@
 package surf
 
-import (
-	"bytes"
-	"fmt"
-)
-
 // SuffixType is SuRF's suffix type.
 type SuffixType uint8
 
@@ -34,7 +29,7 @@ func (st SuffixType) String() string {
 
 const labelTerminator = 0xff
 
-// Builder is a SuRF builder.
+// Builder is the builder of SuRF.
 type Builder struct {
 	sparseStartLevel uint32
 	valueSize        uint32
@@ -56,17 +51,20 @@ type Builder struct {
 	realSuffixLen uint32
 	suffixes      [][]uint64
 	suffixCounts  []uint32
-	values        [][]byte
-	valueCounts   []uint32
+
+	// value
+	values      [][]byte
+	valueCounts []uint32
+
+	// prefix
+	hasPrefix [][]uint64
+	prefixes  [][][]byte
 
 	nodeCounts           []uint32
 	isLastItemTerminator []bool
-
-	pendingKey   []byte
-	pendingValue []byte
 }
 
-// NewBuilder returns a new builder with value size and suffix settings.
+// NewBuilder returns a new SuRF builder.
 func NewBuilder(valueSize uint32, suffixType SuffixType, hashSuffixLen, realSuffixLen uint32) *Builder {
 	switch suffixType {
 	case HashSuffix:
@@ -86,42 +84,82 @@ func NewBuilder(valueSize uint32, suffixType SuffixType, hashSuffixLen, realSuff
 	}
 }
 
-// Add add key and value to builder.
-func (b *Builder) Add(key []byte, value []byte) {
-	if bytes.Compare(b.pendingKey, key) >= 0 {
-		panic(fmt.Sprintf("new added key %v >= prev key %v ", key, b.pendingKey))
-	}
-	b.totalCount++
-	b.processPendingKey(key)
-	b.pendingKey = append(b.pendingKey[:0], key...)
-	b.pendingValue = value
-}
-
-// Finish build a new SuRF based on added kvs.
-func (b *Builder) Finish(bitsPerKeyHint int) *SuRF {
-	b.processPendingKey([]byte{})
+// Build returns the SuRF for added kv pairs.
+// The bitsPerKeyHint is a size hint used when determine how many levels can use the dense-loudes format.
+// The dense-loudes format is faster than sparse-loudes format, but may consume more space.
+func (b *Builder) Build(keys, vals [][]byte, bitsPerKeyHint int) *SuRF {
+	b.totalCount = len(keys)
+	b.buildNodes(keys, vals, 0, 0, 0)
 	b.determineCutoffLevel(bitsPerKeyHint)
 	b.buildDense()
 
+	var prefixVec prefixVec
+	numItemsPerLevel := make([]uint32, b.treeHeight())
+	for level := range numItemsPerLevel {
+		numItemsPerLevel[level] = b.nodeCounts[level]
+	}
+	prefixVec.Init(b.hasPrefix, numItemsPerLevel, b.prefixes)
+
 	surf := new(SuRF)
-	surf.ld.init(b)
-	surf.ls.init(b)
+	surf.ld.Init(b)
+	surf.ls.Init(b)
 	return surf
 }
 
-func (b *Builder) processPendingKey(curr []byte) {
-	if len(b.pendingKey) == 0 {
-		return
+func (b *Builder) buildNodes(keys, vals [][]byte, prefixDepth, depth, level int) {
+	b.ensureLevel(level)
+	nodeStartPos := b.numItems(level)
+
+	groupStart := 0
+	if depth >= len(keys[groupStart]) {
+		b.lsLabels[level] = append(b.lsLabels[level], labelTerminator)
+		b.isLastItemTerminator[level] = true
+		b.insertSuffix(keys[groupStart], level, depth)
+		b.insertValue(vals[groupStart], level)
+		b.moveToNextItemSlot(level)
+		groupStart++
 	}
-	level := b.skipCommonPrefix(b.pendingKey)
-	level = b.insertKeyIntoTrieUntilUnique(b.pendingKey, curr, level)
-	b.insertSuffix(b.pendingKey, level)
-	b.insertValue(b.pendingValue, level)
+
+	for groupEnd := groupStart; groupEnd <= len(keys); groupEnd++ {
+		if groupEnd < len(keys) && keys[groupStart][depth] == keys[groupEnd][depth] {
+			continue
+		}
+
+		if groupEnd == len(keys) && groupStart == 0 && groupEnd-groupStart != 1 {
+			// node at this level is one-way node, compress it to next node
+			b.buildNodes(keys, vals, prefixDepth, depth+1, level)
+			return
+		}
+
+		b.lsLabels[level] = append(b.lsLabels[level], keys[groupStart][depth])
+		b.moveToNextItemSlot(level)
+		if groupEnd-groupStart == 1 {
+			b.insertSuffix(keys[groupStart], level, depth)
+			b.insertValue(vals[groupStart], level)
+		} else {
+			setBit(b.lsHasChild[level], b.numItems(level)-1)
+			b.buildNodes(keys[groupStart:groupEnd], vals[groupStart:groupEnd], depth+1, depth+1, level+1)
+		}
+
+		groupStart = groupEnd
+	}
+
+	if depth-prefixDepth > 0 {
+		prefix := keys[0][prefixDepth:depth]
+		setBit(b.hasPrefix[level], b.nodeCounts[level])
+		b.insertPrefix(prefix, level)
+	}
+	setBit(b.lsLoudsBits[level], nodeStartPos)
+
+	b.nodeCounts[level]++
+	if b.nodeCounts[level]%wordSize == 0 {
+		b.hasPrefix[level] = append(b.hasPrefix[level], 0)
+	}
 }
 
 func (b *Builder) buildDense() {
-	var level uint32
-	for level = 0; level < b.sparseStartLevel; level++ {
+	var level int
+	for level = 0; uint32(level) < b.sparseStartLevel; level++ {
 		b.initDenseVectors(level)
 		if b.numItems(level) == 0 {
 			continue
@@ -149,7 +187,138 @@ func (b *Builder) buildDense() {
 	}
 }
 
-func (b *Builder) setLabelAndHasChildVec(level, nodeID, pos uint32) {
+func (b *Builder) ensureLevel(level int) {
+	if level >= b.treeHeight() {
+		b.addLevel()
+	}
+}
+
+func (b *Builder) suffixLen() uint32 {
+	return b.hashSuffixLen + b.realSuffixLen
+}
+
+func (b *Builder) treeHeight() int {
+	return len(b.nodeCounts)
+}
+
+func (b *Builder) numItems(level int) uint32 {
+	return uint32(len(b.lsLabels[level]))
+}
+
+func (b *Builder) addLevel() {
+	b.lsLabels = append(b.lsLabels, []byte{})
+	b.lsHasChild = append(b.lsHasChild, []uint64{})
+	b.lsLoudsBits = append(b.lsLoudsBits, []uint64{})
+	b.hasPrefix = append(b.hasPrefix, []uint64{})
+	b.suffixes = append(b.suffixes, []uint64{})
+	b.suffixCounts = append(b.suffixCounts, 0)
+	b.values = append(b.values, []byte{})
+	b.valueCounts = append(b.valueCounts, 0)
+	b.prefixes = append(b.prefixes, [][]byte{})
+
+	b.nodeCounts = append(b.nodeCounts, 0)
+	b.isLastItemTerminator = append(b.isLastItemTerminator, false)
+
+	level := b.treeHeight() - 1
+	b.lsHasChild[level] = append(b.lsHasChild[level], 0)
+	b.lsLoudsBits[level] = append(b.lsLoudsBits[level], 0)
+	b.hasPrefix[level] = append(b.hasPrefix[level], 0)
+}
+
+func (b *Builder) moveToNextItemSlot(level int) {
+	if b.numItems(level)%wordSize == 0 {
+		b.lsHasChild[level] = append(b.lsHasChild[level], 0)
+		b.lsLoudsBits[level] = append(b.lsLoudsBits[level], 0)
+	}
+}
+
+func (b *Builder) insertSuffix(key []byte, level, depth int) {
+	if level >= b.treeHeight() {
+		b.addLevel()
+	}
+	suffix := constructSuffix(key, uint32(depth)+1, b.suffixType, b.realSuffixLen, b.hashSuffixLen)
+
+	suffixLen := b.suffixLen()
+	pos := b.suffixCounts[level] * suffixLen
+	if pos == uint32(len(b.suffixes[level])*wordSize) {
+		b.suffixes[level] = append(b.suffixes[level], 0)
+	}
+	wordID := pos / wordSize
+	offset := pos % wordSize
+	remain := wordSize - offset
+	if suffixLen <= remain {
+		shift := remain - suffixLen
+		b.suffixes[level][wordID] += suffix << shift
+	} else {
+		left := suffix >> (suffixLen - remain)
+		right := suffix << (wordSize - (suffixLen - remain))
+		b.suffixes[level][wordID] += left
+		b.suffixes[level] = append(b.suffixes[level], right)
+	}
+	b.suffixCounts[level]++
+}
+
+func (b *Builder) insertValue(value []byte, level int) {
+	b.values[level] = append(b.values[level], value[:b.valueSize]...)
+	b.valueCounts[level]++
+}
+
+func (b *Builder) insertPrefix(prefix []byte, level int) {
+	b.prefixes[level] = append(b.prefixes[level], append([]byte{}, prefix...))
+}
+
+func (b *Builder) determineCutoffLevel(bitsPerKeyHint int) {
+	height := b.treeHeight()
+	if height == 0 {
+		return
+	}
+
+	sizeHint := uint64(b.totalCount * bitsPerKeyHint)
+	suffixSize := uint64(b.totalCount) * uint64(b.suffixLen())
+	var prefixSize uint64
+	for _, l := range b.prefixes {
+		for _, p := range l {
+			prefixSize += uint64(len(p)) * 8
+		}
+	}
+	for _, nc := range b.nodeCounts {
+		prefixSize += uint64(nc)
+	}
+
+	var level int
+	for level = height - 1; level > 0; level-- {
+		ds := b.denseSizeNoSuffix(level)
+		ss := b.sparseSizeNoSuffix(level)
+		sz := ds + ss + suffixSize + prefixSize
+		if sz <= sizeHint {
+			break
+		}
+	}
+	b.sparseStartLevel = uint32(level)
+}
+
+func (b *Builder) denseSizeNoSuffix(level int) uint64 {
+	var total uint64
+	for l := 0; l < level; l++ {
+		total += uint64(2 * denseFanout * b.nodeCounts[l])
+		if l > 0 {
+			total += uint64(b.nodeCounts[l-1])
+		}
+	}
+	return total
+}
+
+func (b *Builder) sparseSizeNoSuffix(level int) uint64 {
+	var total uint64
+	height := b.treeHeight()
+	for l := level; l < height; l++ {
+		n := uint64(len(b.lsLabels[l]))
+		total += n*8 + 2*n
+	}
+	return total
+}
+
+func (b *Builder) setLabelAndHasChildVec(level int, nodeID, pos uint32) {
 	label := b.lsLabels[level][pos]
 	setBit(b.ldLabels[level], nodeID*denseFanout+uint32(label))
 	if readBit(b.lsHasChild[level], pos) {
@@ -157,7 +326,7 @@ func (b *Builder) setLabelAndHasChildVec(level, nodeID, pos uint32) {
 	}
 }
 
-func (b *Builder) initDenseVectors(level uint32) {
+func (b *Builder) initDenseVectors(level int) {
 	vecLength := b.nodeCounts[level] * (denseFanout / wordSize)
 	prefixVecLen := b.nodeCounts[level] / wordSize
 	if b.nodeCounts[level]%wordSize != 0 {
@@ -169,189 +338,11 @@ func (b *Builder) initDenseVectors(level uint32) {
 	b.ldIsPrefix = append(b.ldIsPrefix, make([]uint64, prefixVecLen))
 }
 
-func (b *Builder) isStartOfNode(level, pos uint32) bool {
+func (b *Builder) isStartOfNode(level int, pos uint32) bool {
 	return readBit(b.lsLoudsBits[level], pos)
 }
 
-func (b *Builder) isTerminator(level, pos uint32) bool {
+func (b *Builder) isTerminator(level int, pos uint32) bool {
 	label := b.lsLabels[level][pos]
 	return (label == labelTerminator) && !readBit(b.lsHasChild[level], pos)
-}
-
-func (b *Builder) suffixLen() uint32 {
-	return b.hashSuffixLen + b.realSuffixLen
-}
-
-func (b *Builder) treeHeight() uint32 {
-	return uint32(len(b.nodeCounts))
-}
-
-func (b *Builder) numItems(level uint32) uint32 {
-	return uint32(len(b.lsLabels[level]))
-}
-
-func (b *Builder) isLevelEmpty(level uint32) bool {
-	return level >= b.treeHeight() || len(b.lsLabels[level]) == 0
-}
-
-func (b *Builder) determineCutoffLevel(bitsPerKeyHint int) {
-	height := b.treeHeight()
-	if height == 0 {
-		return
-	}
-
-	sizeHint := uint64(b.totalCount * bitsPerKeyHint)
-	suffixAndValueSize := uint64(b.totalCount) * uint64(b.suffixLen())
-	var level uint32
-	for level = height - 1; level > 0; level-- {
-		ds := b.denseSizeNoSuffix(level)
-		ss := b.sparseSizeNoSuffix(level)
-		sz := ds + ss + suffixAndValueSize
-		if sz <= sizeHint {
-			break
-		}
-	}
-	b.sparseStartLevel = level
-}
-
-func (b *Builder) denseSizeNoSuffix(level uint32) uint64 {
-	var total uint64
-	for l := 0; uint32(l) < level; l++ {
-		total += uint64(2 * denseFanout * b.nodeCounts[l])
-		if l > 0 {
-			total += uint64(b.nodeCounts[l-1])
-		}
-	}
-	return total
-}
-
-func (b *Builder) sparseSizeNoSuffix(level uint32) uint64 {
-	var total uint64
-	height := b.treeHeight()
-	for l := level; l < height; l++ {
-		n := uint64(len(b.lsLabels[l]))
-		total += n*8 + 2*n
-	}
-	return total
-}
-
-func (b *Builder) insertSuffix(key []byte, level uint32) {
-	if level >= b.treeHeight() {
-		b.addLevel()
-	}
-	suffix := constructSuffix(key, level, b.suffixType, b.realSuffixLen, b.hashSuffixLen)
-
-	suffixLen := b.suffixLen()
-	suffixLevel := level - 1
-	pos := b.suffixCounts[suffixLevel] * suffixLen
-	if pos == uint32(len(b.suffixes[suffixLevel])*wordSize) {
-		b.suffixes[suffixLevel] = append(b.suffixes[suffixLevel], 0)
-	}
-	wordID := pos / wordSize
-	offset := pos % wordSize
-	remain := wordSize - offset
-	if suffixLen <= remain {
-		shift := remain - suffixLen
-		b.suffixes[suffixLevel][wordID] += suffix << shift
-	} else {
-		left := suffix >> (suffixLen - remain)
-		right := suffix << (wordSize - (suffixLen - remain))
-		b.suffixes[suffixLevel][wordID] += left
-		b.suffixes[suffixLevel] = append(b.suffixes[suffixLevel], right)
-	}
-	b.suffixCounts[suffixLevel]++
-}
-
-func (b *Builder) insertValue(value []byte, level uint32) {
-	valueLevel := level - 1
-	b.values[valueLevel] = append(b.values[valueLevel], value[:b.valueSize]...)
-	b.valueCounts[valueLevel]++
-}
-
-func (b *Builder) skipCommonPrefix(key []byte) uint32 {
-	var level uint32
-	for level < uint32(len(key)) && b.isCharCommonPrefix(key[level], level) {
-		setBit(b.lsHasChild[level], b.numItems(level)-1)
-		level++
-	}
-	return level
-}
-
-func (b *Builder) isCharCommonPrefix(c byte, level uint32) bool {
-	return (level < b.treeHeight()) && (!b.isLastItemTerminator[level]) &&
-		(c == b.lsLabels[level][len(b.lsLabels[level])-1])
-}
-
-func (b *Builder) insertKeyIntoTrieUntilUnique(key, nextKey []byte, level uint32) uint32 {
-	var isStartOfNode bool
-	if b.isLevelEmpty(level) {
-		// If it is the start of level, the louds bit needs to be set.
-		isStartOfNode = true
-	}
-
-	b.insertByte(key[level], level, isStartOfNode, false)
-	level++
-
-	// build suffix.
-	if level > uint32(len(nextKey)) || !bytes.Equal(key[:level], nextKey[:level]) {
-		return level
-	}
-
-	isStartOfNode = true
-	for level < uint32(len(key)) && level < uint32(len(nextKey)) && key[level] == nextKey[level] {
-		b.insertByte(key[level], level, isStartOfNode, false)
-		level++
-	}
-
-	// The last byte inserted makes key unique in the trie.
-	if level < uint32(len(key)) {
-		b.insertByte(key[level], level, isStartOfNode, false)
-	} else {
-		b.insertByte(labelTerminator, level, isStartOfNode, true)
-	}
-	level++
-	return level
-}
-
-func (b *Builder) insertByte(c byte, level uint32, isStartOfNode, isTerm bool) {
-	if level >= b.treeHeight() {
-		b.addLevel()
-	}
-
-	if level > 0 {
-		setBit(b.lsHasChild[level-1], b.numItems(level-1)-1)
-	}
-
-	b.lsLabels[level] = append(b.lsLabels[level], c)
-	if isStartOfNode {
-		setBit(b.lsLoudsBits[level], b.numItems(level)-1)
-		b.nodeCounts[level]++
-	}
-	b.isLastItemTerminator[level] = isTerm
-
-	b.moveToNextItemSlot(level)
-}
-
-func (b *Builder) moveToNextItemSlot(level uint32) {
-	if b.numItems(level)%wordSize == 0 {
-		b.lsHasChild[level] = append(b.lsHasChild[level], 0)
-		b.lsLoudsBits[level] = append(b.lsLoudsBits[level], 0)
-	}
-}
-
-func (b *Builder) addLevel() {
-	b.lsLabels = append(b.lsLabels, []byte{})
-	b.lsHasChild = append(b.lsHasChild, []uint64{})
-	b.lsLoudsBits = append(b.lsLoudsBits, []uint64{})
-	b.suffixes = append(b.suffixes, []uint64{})
-	b.suffixCounts = append(b.suffixCounts, 0)
-	b.values = append(b.values, []byte{})
-	b.valueCounts = append(b.valueCounts, 0)
-
-	b.nodeCounts = append(b.nodeCounts, 0)
-	b.isLastItemTerminator = append(b.isLastItemTerminator, false)
-
-	level := b.treeHeight() - 1
-	b.lsHasChild[level] = append(b.lsHasChild[level], 0)
-	b.lsLoudsBits[level] = append(b.lsLoudsBits[level], 0)
 }

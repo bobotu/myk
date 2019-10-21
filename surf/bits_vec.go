@@ -3,7 +3,6 @@ package surf
 import (
 	"io"
 	"math/bits"
-	"unsafe"
 )
 
 type bitVector struct {
@@ -23,31 +22,32 @@ func (v *bitVector) bitsSize() uint32 {
 	return v.numWords() * 8
 }
 
-func (v *bitVector) init(bitsPerLevel [][]uint64, numBitsPerLevel []uint32, startLevel, endLevel uint32) {
-	for l := startLevel; l < endLevel; l++ {
-		v.numBits += numBitsPerLevel[l]
+func (v *bitVector) init(bitsPerLevel [][]uint64, numBitsPerLevel []uint32) {
+	for _, n := range numBitsPerLevel {
+		v.numBits += n
 	}
 
 	v.bits = make([]uint64, v.numWords())
 
 	var wordID, bitShift uint32
-	for level := startLevel; level < endLevel; level++ {
-		if numBitsPerLevel[level] == 0 {
+	for level, bits := range bitsPerLevel {
+		n := numBitsPerLevel[level]
+		if n == 0 {
 			continue
 		}
 
-		nCompleteWords := numBitsPerLevel[level] / wordSize
+		nCompleteWords := n / wordSize
 		for word := 0; uint32(word) < nCompleteWords; word++ {
-			v.bits[wordID] |= bitsPerLevel[level][word] >> bitShift
+			v.bits[wordID] |= bits[word] >> bitShift
 			wordID++
 			if bitShift > 0 {
-				v.bits[wordID] |= bitsPerLevel[level][word] << (wordSize - bitShift)
+				v.bits[wordID] |= bits[word] << (wordSize - bitShift)
 			}
 		}
 
-		remain := numBitsPerLevel[level] % wordSize
+		remain := n % wordSize
 		if remain > 0 {
-			lastWord := bitsPerLevel[level][nCompleteWords]
+			lastWord := bits[nCompleteWords]
 			v.bits[wordID] |= lastWord >> bitShift
 			if bitShift+remain <= wordSize {
 				bitShift = (bitShift + remain) % wordSize
@@ -133,18 +133,18 @@ type valueVector struct {
 	valueSize uint32
 }
 
-func (v *valueVector) init(valuesPerLevel [][]byte, valueSize, startLevel, endLevel uint32) {
+func (v *valueVector) Init(valuesPerLevel [][]byte, valueSize uint32) {
 	var size int
-	for l := startLevel; l < endLevel; l++ {
+	for l := range valuesPerLevel {
 		size += len(valuesPerLevel[l])
 	}
 	v.valueSize = valueSize
 	v.bytes = make([]byte, size)
 
 	var pos uint32
-	for l := startLevel; l < endLevel; l++ {
-		copy(v.bytes[pos:], valuesPerLevel[l])
-		pos += uint32(len(valuesPerLevel[l]))
+	for _, val := range valuesPerLevel {
+		copy(v.bytes[pos:], val)
+		pos += uint32(len(val))
 	}
 }
 
@@ -205,8 +205,8 @@ type selectVector struct {
 	selectLut []uint32
 }
 
-func (v *selectVector) init(bitsPerLevel [][]uint64, numBitsPerLevel []uint32, startLevel, endLevel uint32) *selectVector {
-	v.bitVector.init(bitsPerLevel, numBitsPerLevel, startLevel, endLevel)
+func (v *selectVector) Init(bitsPerLevel [][]uint64, numBitsPerLevel []uint32) *selectVector {
+	v.bitVector.init(bitsPerLevel, numBitsPerLevel)
 	lut := []uint32{0}
 	sampledOnes := selectSampleInterval
 	onesUptoWord := 0
@@ -270,10 +270,6 @@ func (v *selectVector) Select(rank uint32) uint32 {
 	return wordOff*wordSize + uint32(select64(w, int(rankLeft)))
 }
 
-func (v *selectVector) MemSize() uint32 {
-	return uint32(unsafe.Sizeof(*v)) + v.bitsSize() + v.lutSize()
-}
-
 func (v *selectVector) MarshalSize() int64 {
 	return align(v.rawMarshalSize())
 }
@@ -333,8 +329,8 @@ type rankVector struct {
 	rankLut   []uint32
 }
 
-func (v *rankVector) init(blockSize uint32, bitsPerLevel [][]uint64, numBitsPerLevel []uint32, startLevel, endLevel uint32) *rankVector {
-	v.bitVector.init(bitsPerLevel, numBitsPerLevel, startLevel, endLevel)
+func (v *rankVector) init(blockSize uint32, bitsPerLevel [][]uint64, numBitsPerLevel []uint32) *rankVector {
+	v.bitVector.init(bitsPerLevel, numBitsPerLevel)
 	v.blockSize = blockSize
 	wordPerBlk := v.blockSize / wordSize
 	nblks := v.numBits/v.blockSize + 1
@@ -351,10 +347,6 @@ func (v *rankVector) init(blockSize uint32, bitsPerLevel [][]uint64, numBitsPerL
 
 func (v *rankVector) lutSize() uint32 {
 	return (v.numBits/v.blockSize + 1) * 4
-}
-
-func (v *rankVector) MemSize() uint32 {
-	return uint32(unsafe.Sizeof(*v)) + v.bitsSize() + v.lutSize()
 }
 
 func (v *rankVector) MarshalSize() int64 {
@@ -409,8 +401,8 @@ type rankVectorDense struct {
 	rankVector
 }
 
-func (v *rankVectorDense) init(bitsPerLevel [][]uint64, numBitsPerLevel []uint32, startLevel, endLevel uint32) {
-	v.rankVector.init(rankDenseBlockSize, bitsPerLevel, numBitsPerLevel, startLevel, endLevel)
+func (v *rankVectorDense) Init(bitsPerLevel [][]uint64, numBitsPerLevel []uint32) {
+	v.rankVector.init(rankDenseBlockSize, bitsPerLevel, numBitsPerLevel)
 }
 
 func (v *rankVectorDense) Rank(pos uint32) uint32 {
@@ -425,8 +417,8 @@ type rankVectorSparse struct {
 	rankVector
 }
 
-func (v *rankVectorSparse) init(bitsPerLevel [][]uint64, numBitsPerLevel []uint32, startLevel, endLevel uint32) {
-	v.rankVector.init(rankSparseBlockSize, bitsPerLevel, numBitsPerLevel, startLevel, endLevel)
+func (v *rankVectorSparse) Init(bitsPerLevel [][]uint64, numBitsPerLevel []uint32) {
+	v.rankVector.init(rankSparseBlockSize, bitsPerLevel, numBitsPerLevel)
 }
 
 func (v *rankVectorSparse) Rank(pos uint32) uint32 {

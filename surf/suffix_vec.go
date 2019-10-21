@@ -2,7 +2,6 @@ package surf
 
 import (
 	"io"
-	"unsafe"
 
 	"github.com/dgryski/go-farm"
 )
@@ -20,8 +19,8 @@ type suffixVector struct {
 	realSuffixLen uint32
 }
 
-func (v *suffixVector) init(suffixType SuffixType, hashLen, realLen uint32, bitsPerLevel [][]uint64, numBitsPerLevel []uint32, startLevel, endLevel uint32) *suffixVector {
-	v.bitVector.init(bitsPerLevel, numBitsPerLevel, startLevel, endLevel)
+func (v *suffixVector) Init(suffixType SuffixType, hashLen, realLen uint32, bitsPerLevel [][]uint64, numBitsPerLevel []uint32) *suffixVector {
+	v.bitVector.init(bitsPerLevel, numBitsPerLevel)
 	v.suffixType = suffixType
 	v.hashSuffixLen = hashLen
 	v.realSuffixLen = realLen
@@ -71,10 +70,6 @@ func (v *suffixVector) Compare(key []byte, idx, level uint32) int {
 	} else {
 		return 1
 	}
-}
-
-func (v *suffixVector) MemSize() uint32 {
-	return uint32(unsafe.Sizeof(*v)) + v.bitsSize()
 }
 
 func (v *suffixVector) MarshalSize() int64 {

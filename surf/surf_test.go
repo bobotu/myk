@@ -1,12 +1,17 @@
 package surf
 
 import (
+	"bufio"
 	"bytes"
+	"compress/bzip2"
 	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/pingcap/tidb/tablecodec"
@@ -24,7 +29,52 @@ var (
 	intKeysTrunc [][]byte
 	handles      [][]byte
 	handlesRnd   [][19]byte
+
+	datasets map[string][][]byte
 )
+
+func truncateSuffixes(keys [][]byte) [][]byte {
+	result := make([][]byte, 0, len(keys))
+	commonPrefixLen := 0
+	for i := 0; i < len(keys); i++ {
+		if i == 0 {
+			commonPrefixLen = getCommonPrefixLen(keys[i], keys[i+1])
+		} else if i == len(keys)-1 {
+			commonPrefixLen = getCommonPrefixLen(keys[i-1], keys[i])
+		} else {
+			commonPrefixLen = getCommonPrefixLen(keys[i-1], keys[i])
+			b := getCommonPrefixLen(keys[i], keys[i+1])
+			if b > commonPrefixLen {
+				commonPrefixLen = b
+			}
+		}
+
+		if commonPrefixLen < len(keys[i]) {
+			result = append(result, keys[i][:commonPrefixLen+1])
+		} else {
+			k := make([]byte, 0, len(keys[i])+1)
+			k = append(k, keys[i]...)
+			result = append(result, append(k, labelTerminator))
+		}
+	}
+
+	return result
+}
+
+func truncateKey(k []byte) []byte {
+	if k[len(k)-1] == labelTerminator {
+		k = k[:len(k)-1]
+	}
+	return k
+}
+
+func getCommonPrefixLen(a, b []byte) int {
+	l := 0
+	for l < len(a) && l < len(b) && a[l] == b[l] {
+		l++
+	}
+	return l
+}
 
 func initTexture() {
 	intKeys = make([][]byte, 0, 1000000)
@@ -36,22 +86,142 @@ func initTexture() {
 	})
 	intKeysTrunc = truncateSuffixes(intKeys)
 
-	handles = make([][]byte, 0, 1000000)
+	handles = make([][]byte, 0, 3000000)
 	rnd := rand.New(rand.NewSource(0xdeadbeaf))
-	for i := 0; i < 1000000; i++ {
+	for i := 0; i < 3000000; i++ {
 		k := tablecodec.EncodeRowKeyWithHandle(rnd.Int63n(15)+1, rnd.Int63())
 		handles = append(handles, k)
 	}
+	sort.Slice(handles, func(i, j int) bool {
+		return bytes.Compare(handles[i], handles[j]) < 0
+	})
 	handlesRnd = make([][19]byte, len(handles))
 	p := rand.New(rand.NewSource(0xdeadbeaf)).Perm(len(handles))
 	for i, idx := range p {
 		copy(handlesRnd[i][:], handles[idx])
 	}
+
+	datasets = make(map[string][][]byte)
+	datasets["handles"] = handles
+	var wg sync.WaitGroup
+	filepath.Walk("../dataset", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			panic(err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !strings.HasSuffix(info.Name(), ".txt.bz2") {
+				return
+			}
+
+			f, err := os.Open(path)
+			if err != nil {
+				panic(err)
+			}
+			sc := bufio.NewScanner(bzip2.NewReader(f))
+
+			var data [][]byte
+			for sc.Scan() {
+				data = append(data, append([]byte{}, sc.Bytes()...))
+			}
+			sort.Slice(data, func(i, j int) bool {
+				return bytes.Compare(data[i], data[j]) < 0
+			})
+			datasets[strings.TrimSuffix(info.Name(), ".txt.bz2")] = data
+		}()
+
+		return nil
+	})
+	wg.Wait()
 }
 
 func TestMain(m *testing.M) {
 	initTexture()
 	os.Exit(m.Run())
+}
+
+func TestSingleKey(t *testing.T) {
+	builder := NewBuilder(2, MixedSuffix, 2, 2)
+	s := builder.Build([][]byte{{1, 2, 3, 4, 5, 6, 7, 8, 9}}, [][]byte{{1, 2}}, 10)
+	v, ok := s.Get([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9})
+	require.True(t, ok)
+	require.Equal(t, []byte{1, 2}, v)
+}
+
+func TestTableRowKeyWithVaryTid(t *testing.T) {
+	for _, n := range []int{10000, 100000, 500000, 1000000} {
+		for _, x := range []int{2, 5, 10, 50, 100} {
+			func(n, x int) {
+				t.Run(fmt.Sprintf("%d/%d", n, x), func(t *testing.T) {
+					t.Parallel()
+
+					rnd := rand.New(rand.NewSource(0xdeadbeaf))
+					handles := rnd.Perm(3 * n)
+
+					a := make([][]byte, 0, n)
+					b := make([][]byte, 0, n*2)
+					for i := 0; i < n; i += 3 {
+						tid := int64(i % x)
+						a = append(a, tablecodec.EncodeRowKeyWithHandle(tid, int64(handles[i])))
+						b = append(b, tablecodec.EncodeRowKeyWithHandle(tid, int64(handles[i+1])))
+						b = append(b, tablecodec.EncodeRowKeyWithHandle(tid, int64(handles[i+2])))
+					}
+					sort.Slice(a, func(i, j int) bool {
+						return bytes.Compare(a[i], a[j]) < 0
+					})
+
+					surf := NewBuilder(10, MixedSuffix, 4, 4).Build(a, a, 48)
+
+					for _, k := range a {
+						v, ok := surf.Get(k)
+						require.Equal(t, k[:len(v)], v)
+						require.True(t, ok)
+					}
+
+					var fp int
+					for _, k := range b {
+						if _, ok := surf.Get(k); ok {
+							fp++
+						}
+					}
+					t.Logf("[n: %d, x: %d], fp: %f%% (size: %d)", n, x, float64(fp)/float64(len(b))*100.0, surf.MarshalSize())
+				})
+			}(n, x)
+		}
+	}
+}
+
+func TestWithDatasets(t *testing.T) {
+	for name, data := range datasets {
+		for _, n := range []int{100000, 500000, 1000000} {
+			func(data [][]byte, n int, name string) {
+				t.Run(fmt.Sprintf("%s/%d", name, n), func(t *testing.T) {
+					t.Parallel()
+					keys := append([][]byte{}, data[:n]...)
+					sort.Slice(keys, func(i, j int) bool {
+						return bytes.Compare(keys[i], keys[j]) < 0
+					})
+
+					surf := NewBuilder(3, MixedSuffix, 4, 4).Build(keys, keys, 48)
+
+					for _, k := range keys {
+						v, ok := surf.Get(k)
+						require.Equal(t, k[:3], v)
+						require.True(t, ok)
+					}
+
+					var fp int
+					for _, k := range data[n:] {
+						if _, ok := surf.Get(k); ok {
+							fp++
+						}
+					}
+					t.Logf("[data: %s, n: %d], fp: %f%% (size: %d)", name, n, float64(fp)/float64(len(data[n:]))*100.0, surf.MarshalSize())
+				})
+			}(data[:n*3], n, name)
+		}
+	}
 }
 
 func TestKeysExist(t *testing.T) {
@@ -67,44 +237,18 @@ func TestKeysExist(t *testing.T) {
 			t.Run(fmt.Sprintf("suffix=%s,suffixLen=%d", sf, sl), func(t *testing.T) {
 				builder := NewBuilder(2, sf, sl, sl)
 				t.Parallel()
-				surf := builder.bulk(intKeys)
-				for i, k := range intKeys {
+				surf := builder.bulk(handles)
+				for i, k := range handles {
 					val, ok := surf.Get(k)
-					require.EqualValues(t, u16ToBytes(uint16(i)), val)
+					if !ok {
+						t.Logf("%d %v", i, k)
+					}
 					require.True(t, ok)
+					require.EqualValues(t, u16ToBytes(uint16(i)), val)
 				}
 			})
 		}
 	}
-}
-
-func TestEmptySuRF(t *testing.T) {
-	builder := NewBuilder(2, HashSuffix, 2, 0)
-	surf := builder.Finish(20)
-	_, ok := surf.Get([]byte{1, 2})
-	require.False(t, ok)
-	it := surf.NewIterator()
-	it.SeekToFirst()
-	require.False(t, it.Valid())
-	it.Seek([]byte{1, 2, 3, 4})
-	require.False(t, it.Valid())
-	it.SeekToLast()
-	require.False(t, it.Valid())
-	require.False(t, surf.HasRange([]byte{}, []byte{12}))
-
-	buf := surf.Marshal()
-	var surf1 SuRF
-	surf1.Unmarshal(buf)
-	_, ok = surf1.Get([]byte{1, 2})
-	require.False(t, ok)
-	it = surf.NewIterator()
-	it.SeekToFirst()
-	require.False(t, it.Valid())
-	it.Seek([]byte{1, 2, 3, 4})
-	require.False(t, it.Valid())
-	it.SeekToLast()
-	require.False(t, it.Valid())
-	require.False(t, surf1.HasRange([]byte{}, []byte{12}))
 }
 
 func TestMarshal(t *testing.T) {
@@ -123,32 +267,65 @@ func TestMarshal(t *testing.T) {
 }
 
 func TestIterator(t *testing.T) {
-	builder := NewBuilder(2, NoneSuffix, 0, 0)
-	surf := builder.bulk(intKeys)
-	it := surf.NewIterator()
+	for name, data := range datasets {
+		func(name string, data [][]byte) {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				builder := NewBuilder(2, NoneSuffix, 0, 0)
+				surf := builder.bulk(data)
+				it := surf.NewIterator()
 
-	var i int
-	for it.SeekToFirst(); it.Valid(); it.Next() {
-		require.Equal(t, truncateKey(intKeysTrunc[i]), it.Key())
-		require.Equal(t, u16ToBytes(uint16(i)), it.Value())
-		i++
+				var i int
+				for it.SeekToFirst(); it.Valid(); it.Next() {
+					require.Truef(t, bytes.HasPrefix(data[i], it.Key()), "%d", i)
+					require.Equal(t, u16ToBytes(uint16(i)), it.Value())
+					i++
+				}
+			})
+		}(name, data)
 	}
 }
 
 func TestIteratorReverse(t *testing.T) {
-	builder := NewBuilder(2, NoneSuffix, 0, 0)
-	surf := builder.bulk(intKeys)
-	it := surf.NewIterator()
+	for name, data := range datasets {
+		func(name string, data [][]byte) {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				builder := NewBuilder(2, NoneSuffix, 0, 0)
+				surf := builder.bulk(data)
+				it := surf.NewIterator()
 
-	i := len(intKeys) - 1
-	for it.SeekToLast(); it.Valid(); it.Prev() {
-		require.Equal(t, truncateKey(intKeysTrunc[i]), it.Key(), i)
-		require.Equal(t, u16ToBytes(uint16(i)), it.Value())
-		i--
+				i := len(data) - 1
+				for it.SeekToLast(); it.Valid(); it.Prev() {
+					require.True(t, bytes.HasPrefix(data[i], it.Key()))
+					require.Equal(t, u16ToBytes(uint16(i)), it.Value())
+					i--
+				}
+			})
+		}(name, data)
 	}
 }
 
-func TestIteratorSeek(t *testing.T) {
+func TestIteratorSeekExist(t *testing.T) {
+	for name, data := range datasets {
+		func(name string, data [][]byte) {
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				builder := NewBuilder(2, NoneSuffix, 0, 0)
+				surf := builder.bulk(data)
+				it := surf.NewIterator()
+
+				for i, k := range data {
+					it.Seek(k)
+					require.True(t, bytes.HasPrefix(data[i], it.Key()))
+					require.Equal(t, u16ToBytes(uint16(i)), it.Value())
+				}
+			})
+		}(name, data)
+	}
+}
+
+func TestIteratorSeekAbsence(t *testing.T) {
 	keys := make([][]byte, 10)
 	for i := range keys {
 		keys[i] = []byte(strconv.Itoa(i * 10))
@@ -168,7 +345,7 @@ func TestIteratorSeek(t *testing.T) {
 
 		fp := it.Seek(key)
 		if idx == len(keys) || !bytes.Equal(truncateKey(truc[idx]), it.Key()) {
-			require.True(t, fp)
+			require.Truef(t, fp, "%d", i)
 			require.Equal(t, truncateKey(truc[idx-1]), it.Key())
 			require.Equal(t, u16ToBytes(uint16(idx-1)), it.Value())
 		} else {
@@ -253,8 +430,9 @@ func (s *SuRF) checkEquals(t *testing.T, o *SuRF) {
 }
 
 func (b *Builder) bulk(keys [][]byte) *SuRF {
-	for i, k := range keys {
-		b.Add(k, u16ToBytes(uint16(i)))
+	vals := make([][]byte, 0, len(keys))
+	for i := range keys {
+		vals = append(vals, u16ToBytes(uint16(i)))
 	}
-	return b.Finish(20)
+	return b.Build(keys, vals, 30)
 }

@@ -3,6 +3,7 @@ module github.com/bobotu/myk
 go 1.12
 
 require (
+	github.com/brianvoe/gofakeit v3.18.0+incompatible
 	github.com/coocood/badger v1.5.1-0.20190716024607-37ea3d37efe9
 	github.com/coocood/bbloom v0.0.0-20180518162752-7774d68761e5
 	github.com/dgryski/go-farm v0.0.0-20190104051053-3adb47b1fb0f

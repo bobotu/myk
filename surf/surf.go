@@ -3,46 +3,52 @@ package surf
 import (
 	"bytes"
 	"io"
-	"unsafe"
 )
 
+// SuRF is a fast succinct trie.
 type SuRF struct {
 	ld loudsDense
 	ls loudsSparse
 }
 
+// Get returns the values mapped by the key, may return value for keys doesn't in SuRF.
 func (s *SuRF) Get(key []byte) ([]byte, bool) {
-	cont, value, ok := s.ld.Get(key)
+	cont, depth, value, ok := s.ld.Get(key)
 	if !ok || cont < 0 {
 		return value, ok
 	}
-	return s.ls.Get(key, uint32(cont))
+	return s.ls.Get(key, depth, uint32(cont))
 }
 
+// HasRange returns does SuRF contains key range [start, end).
+// An empty end key means no upper bound check.
 func (s *SuRF) HasRange(start, end []byte) bool {
 	if s.ld.height == 0 && s.ls.height == 0 {
 		return false
 	}
 	it := s.NewIterator()
-	it.denseIter.seek(start)
+	it.denseIter.Seek(start)
 	if !it.denseIter.valid {
 		return false
 	}
-	if !it.denseIter.isComplete() {
+	if !it.denseIter.IsComplete() {
 		if !it.denseIter.searchComp {
 			it.passToSparse()
-			it.sparseIter.seek(start)
+			it.sparseIter.Seek(start)
 			if !it.sparseIter.valid {
 				it.incrDenseIter()
 			}
 		} else if !it.denseIter.leftComp {
 			it.passToSparse()
-			it.sparseIter.moveToLeftMostKey()
+			it.sparseIter.MoveToLeftMostKey()
 		}
 	}
 
 	if !it.Valid() {
 		return false
+	}
+	if len(end) == 0 {
+		return true
 	}
 	cmp := it.compare(end)
 	if cmp == couldBePositive {
@@ -51,24 +57,24 @@ func (s *SuRF) HasRange(start, end []byte) bool {
 	return cmp < 0
 }
 
-func (s *SuRF) MemSize() uint32 {
-	return uint32(unsafe.Sizeof(*s)) + s.ld.MemSize() + s.ls.MemSize()
-}
-
+// MarshalSize returns the size of SuRF after serialization.
 func (s *SuRF) MarshalSize() int64 {
 	return s.ld.MarshalSize() + s.ls.MarshalSize() + s.ld.values.MarshalSize() + s.ls.values.MarshalSize()
 }
 
+// MarshalNoValueSize returns the size of index part in SuRF after serialization.
 func (s *SuRF) MarshalNoValueSize() int64 {
 	return s.ld.MarshalSize() + s.ls.MarshalSize()
 }
 
+// Marshal returns the serialized SuRF.
 func (s *SuRF) Marshal() []byte {
 	w := bytes.NewBuffer(make([]byte, 0, s.MarshalSize()))
 	_ = s.WriteTo(w)
 	return w.Bytes()
 }
 
+// WriteTo serialize SuRF to writer.
 func (s *SuRF) WriteTo(w io.Writer) error {
 	if err := s.ld.WriteTo(w); err != nil {
 		return err
@@ -79,9 +85,13 @@ func (s *SuRF) WriteTo(w io.Writer) error {
 	if err := s.ld.values.WriteTo(w); err != nil {
 		return err
 	}
-	return s.ls.values.WriteTo(w)
+	if err := s.ls.values.WriteTo(w); err != nil {
+		return err
+	}
+	return nil
 }
 
+// Unmarshal deserialize SuRF from bytes.
 func (s *SuRF) Unmarshal(b []byte) {
 	b = s.ld.Unmarshal(b)
 	b = s.ls.Unmarshal(b)
@@ -89,23 +99,27 @@ func (s *SuRF) Unmarshal(b []byte) {
 	s.ls.values.Unmarshal(b)
 }
 
+// Iterator is iterator of SuRF.
 type Iterator struct {
 	denseIter  denseIter
 	sparseIter sparseIter
 	keyBuf     []byte
 }
 
+// NewIterator returns a new SuRF iterator.
 func (s *SuRF) NewIterator() *Iterator {
 	iter := new(Iterator)
-	iter.denseIter.init(&s.ld)
-	iter.sparseIter.init(&s.ls)
+	iter.denseIter.Init(&s.ld)
+	iter.sparseIter.Init(&s.ls)
 	return iter
 }
 
+// Valid returns the valid status of iterator.
 func (it *Iterator) Valid() bool {
-	return it.denseIter.valid && (it.denseIter.isComplete() || it.sparseIter.valid)
+	return it.denseIter.valid && (it.denseIter.IsComplete() || it.sparseIter.valid)
 }
 
+// Next move the iterator to next key.
 func (it *Iterator) Next() {
 	if it.incrSparseIter() {
 		return
@@ -113,6 +127,7 @@ func (it *Iterator) Next() {
 	it.incrDenseIter()
 }
 
+// Prev move the iterator to previous key.
 func (it *Iterator) Prev() {
 	if it.decrSparseIter() {
 		return
@@ -120,6 +135,7 @@ func (it *Iterator) Prev() {
 	it.decrDenseIter()
 }
 
+// Seek move the iterator to the firest greater or equals to key.
 func (it *Iterator) Seek(key []byte) bool {
 	var fp bool
 	it.Reset()
@@ -128,81 +144,87 @@ func (it *Iterator) Seek(key []byte) bool {
 		return false
 	}
 
-	fp = it.denseIter.seek(key)
-	if !it.denseIter.valid || it.denseIter.isComplete() {
+	fp = it.denseIter.Seek(key)
+	if !it.denseIter.valid || it.denseIter.IsComplete() {
 		return fp
 	}
 
 	if !it.denseIter.searchComp {
 		it.passToSparse()
-		fp = it.sparseIter.seek(key)
+		fp = it.sparseIter.Seek(key)
 		if !it.sparseIter.valid {
 			it.incrDenseIter()
 		}
 		return fp
 	} else if !it.denseIter.leftComp {
 		it.passToSparse()
-		it.sparseIter.moveToLeftMostKey()
+		it.sparseIter.MoveToLeftMostKey()
 		return fp
 	}
 
 	panic("invalid state")
 }
 
+// SeekToFirst move the iterator to the first key in SuRF.
 func (it *Iterator) SeekToFirst() {
 	it.Reset()
 	if it.denseIter.ld.height > 0 {
-		it.denseIter.setToFirstInRoot()
-		it.denseIter.moveToLeftMostKey()
+		it.denseIter.SetToFirstInRoot()
+		it.denseIter.MoveToLeftMostKey()
 		if it.denseIter.leftComp {
 			return
 		}
 		it.passToSparse()
-		it.sparseIter.moveToLeftMostKey()
+		it.sparseIter.MoveToLeftMostKey()
 	} else if it.sparseIter.ls.height > 0 {
-		it.sparseIter.setToFirstInRoot()
-		it.sparseIter.moveToLeftMostKey()
+		it.sparseIter.SetToFirstInRoot()
+		it.sparseIter.MoveToLeftMostKey()
 	}
 }
 
+// SeekToLast move the iterator to the last key in SuRF.
 func (it *Iterator) SeekToLast() {
 	it.Reset()
 	if it.denseIter.ld.height > 0 {
-		it.denseIter.setToLastInRoot()
-		it.denseIter.moveToRightMostKey()
+		it.denseIter.SetToLastInRoot()
+		it.denseIter.MoveToRightMostKey()
 		if it.denseIter.rightComp {
 			return
 		}
 		it.passToSparse()
-		it.sparseIter.moveToRightMostKey()
+		it.sparseIter.MoveToRightMostKey()
 	} else if it.sparseIter.ls.height > 0 {
-		it.sparseIter.setToLastInRoot()
-		it.sparseIter.moveToRightMostKey()
+		it.sparseIter.SetToLastInRoot()
+		it.sparseIter.MoveToRightMostKey()
 	}
 }
 
+// Key returns the key where the iterator at.
 func (it *Iterator) Key() []byte {
-	if it.denseIter.isComplete() {
-		return it.denseIter.key()
+	if it.denseIter.IsComplete() {
+		return it.denseIter.Key()
 	}
-	it.keyBuf = append(it.keyBuf[:0], it.denseIter.key()...)
-	return append(it.keyBuf, it.sparseIter.key()...)
+	it.keyBuf = append(it.keyBuf[:0], it.denseIter.Key()...)
+	return append(it.keyBuf, it.sparseIter.Key()...)
 }
 
+// Value returns the value where the iterator at.
 func (it *Iterator) Value() []byte {
-	if it.denseIter.isComplete() {
-		return it.denseIter.value()
+	if it.denseIter.IsComplete() {
+		return it.denseIter.Value()
 	}
-	return it.sparseIter.value()
+	return it.sparseIter.Value()
 }
 
+// Reset rest iterator's states and buffers.
 func (it *Iterator) Reset() {
-	it.denseIter.reset()
-	it.sparseIter.reset()
+	it.denseIter.Reset()
+	it.sparseIter.Reset()
 }
 
 func (it *Iterator) passToSparse() {
 	it.sparseIter.startNodeID = it.denseIter.sendOutNodeID
+	it.sparseIter.startDepth = it.denseIter.sendOutDepth
 }
 
 func (it *Iterator) incrDenseIter() bool {
@@ -210,7 +232,7 @@ func (it *Iterator) incrDenseIter() bool {
 		return false
 	}
 
-	it.denseIter.next()
+	it.denseIter.Next()
 	if !it.denseIter.valid {
 		return false
 	}
@@ -219,7 +241,7 @@ func (it *Iterator) incrDenseIter() bool {
 	}
 
 	it.passToSparse()
-	it.sparseIter.moveToLeftMostKey()
+	it.sparseIter.MoveToLeftMostKey()
 	return true
 }
 
@@ -227,7 +249,7 @@ func (it *Iterator) incrSparseIter() bool {
 	if !it.sparseIter.valid {
 		return false
 	}
-	it.sparseIter.next()
+	it.sparseIter.Next()
 	return it.sparseIter.valid
 }
 
@@ -236,7 +258,7 @@ func (it *Iterator) decrDenseIter() bool {
 		return false
 	}
 
-	it.denseIter.prev()
+	it.denseIter.Prev()
 	if !it.denseIter.valid {
 		return false
 	}
@@ -245,7 +267,7 @@ func (it *Iterator) decrDenseIter() bool {
 	}
 
 	it.passToSparse()
-	it.sparseIter.moveToRightMostKey()
+	it.sparseIter.MoveToRightMostKey()
 	return true
 }
 
@@ -253,14 +275,14 @@ func (it *Iterator) decrSparseIter() bool {
 	if !it.sparseIter.valid {
 		return false
 	}
-	it.sparseIter.prev()
+	it.sparseIter.Prev()
 	return it.sparseIter.valid
 }
 
 func (it *Iterator) compare(key []byte) int {
-	cmp := it.denseIter.compare(key)
-	if it.denseIter.isComplete() || cmp != 0 {
+	cmp := it.denseIter.Compare(key)
+	if it.denseIter.IsComplete() || cmp != 0 {
 		return cmp
 	}
-	return it.sparseIter.compare(key)
+	return it.sparseIter.Compare(key)
 }

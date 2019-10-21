@@ -4,14 +4,13 @@ import (
 	"bytes"
 	"io"
 	"sort"
-	"unsafe"
 )
 
 type labelVector struct {
 	labels []byte
 }
 
-func (v *labelVector) init(labelsPerLevel [][]byte, startLevel, endLevel uint32) {
+func (v *labelVector) Init(labelsPerLevel [][]byte, startLevel, endLevel uint32) {
 	numBytes := 1
 	for l := startLevel; l < endLevel; l++ {
 		numBytes += len(labelsPerLevel[l])
@@ -35,9 +34,13 @@ func (v *labelVector) Search(k byte, start, size uint32) (uint32, bool) {
 		size--
 	}
 
-	result := bytes.IndexByte(v.labels[start:], k)
+	end := start + size
+	if end > uint32(len(v.labels)) {
+		end = uint32(len(v.labels))
+	}
+	result := bytes.IndexByte(v.labels[start:end], k)
 	if result < 0 {
-		return 0, false
+		return start, false
 	}
 	return start + uint32(result), true
 }
@@ -53,10 +56,6 @@ func (v *labelVector) SearchGreaterThan(label byte, pos, size uint32) (uint32, b
 		return pos + uint32(result) - 1, false
 	}
 	return pos + uint32(result), true
-}
-
-func (v *labelVector) MemSize() uint32 {
-	return uint32(unsafe.Sizeof(*v)) + uint32(len(v.labels))
 }
 
 func (v *labelVector) MarshalSize() int64 {
