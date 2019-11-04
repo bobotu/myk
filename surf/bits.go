@@ -7,34 +7,56 @@ import (
 	"unsafe"
 )
 
-const (
-	wordSize     = 64
-	popcountSize = wordSize
-	popcountMask = popcountSize - 1
-
-	msbMask = 0x8000000000000000
-)
+const wordSize = 64
 
 var endian = binary.LittleEndian
 
-func select64(x uint64, k int) int {
-	if k > bits.OnesCount64(x) {
-		return -1
-	}
+var selectInByteLut [256][8]int
 
-	loc := -1
-	var testbits uint32
-	for testbits = 32; testbits > 0; testbits >>= 1 {
-		cnt := bits.OnesCount64(x >> testbits)
-		if k > cnt {
-			x &= (uint64(1) << testbits) - 1
-			loc += int(testbits)
-			k -= cnt
-		} else {
-			x >>= testbits
+func init() {
+	for i := 0; i < 256; i++ {
+		for j := 0; j < 8; j++ {
+			selectInByteLut[i][j] = selectInByte(i, j)
 		}
 	}
-	return loc + k
+}
+
+func findFirstSet(x int) int {
+	return bits.TrailingZeros64(uint64(x&-x)) + 1
+}
+
+func selectInByte(i, j int) int {
+	r := 0
+	for ; j != 0; j-- {
+		s := findFirstSet(i)
+		r += s
+		i >>= s
+	}
+	if i == 0 {
+		return 8
+	}
+	return r + findFirstSet(i) - 1
+}
+
+func select64Broadword(x uint64, nth int64) int64 {
+	const (
+		onesStep4 = uint64(0x1111111111111111)
+		onesStep8 = uint64(0x0101010101010101)
+		msbsStep8 = uint64(0x80) * onesStep8
+	)
+
+	k := uint64(nth - 1)
+	s := x
+	s -= (s & (0xa * onesStep4)) >> 1
+	s = (s & (0x3 * onesStep4)) + ((s >> 2) & (0x3 * onesStep4))
+	s = (s + (s >> 4)) & (0xf * onesStep8)
+	byteSums := s * onesStep8
+
+	step8 := k * onesStep8
+	geqKStep8 := ((step8 | msbsStep8) - byteSums) & msbsStep8
+	place := bits.OnesCount64(geqKStep8) * 8
+	byteRank := k - (((byteSums << 8) >> place) & uint64(0xff))
+	return int64(place + selectInByteLut[(x>>place)&0xff][byteRank])
 }
 
 func popcountBlock(bs []uint64, off, nbits uint32) uint32 {
@@ -42,26 +64,27 @@ func popcountBlock(bs []uint64, off, nbits uint32) uint32 {
 		return 0
 	}
 
-	lastWord := (nbits - 1) / popcountSize
+	lastWord := (nbits - 1) / wordSize
+	lastBits := (nbits - 1) % wordSize
 	var i, p uint32
 
 	for i = 0; i < lastWord; i++ {
 		p += uint32(bits.OnesCount64(bs[off+i]))
 	}
-	last := bs[off+lastWord] >> (63 - ((nbits - 1) & popcountMask))
+	last := bs[off+lastWord] << (wordSize - 1 - lastBits)
 	return p + uint32(bits.OnesCount64(last))
 }
 
 func readBit(bs []uint64, pos uint32) bool {
 	wordOff := pos / wordSize
 	bitsOff := pos % wordSize
-	return bs[wordOff]&(msbMask>>bitsOff) != 0
+	return bs[wordOff]&(uint64(1)<<bitsOff) != 0
 }
 
 func setBit(bs []uint64, pos uint32) {
 	wordOff := pos / wordSize
 	bitsOff := pos % wordSize
-	bs[wordOff] |= msbMask >> bitsOff
+	bs[wordOff] |= uint64(1) << bitsOff
 }
 
 func align(off int64) int64 {

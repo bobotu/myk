@@ -246,14 +246,9 @@ func (b *Builder) insertSuffix(key []byte, level, depth int) {
 	wordID := pos / wordSize
 	offset := pos % wordSize
 	remain := wordSize - offset
-	if suffixLen <= remain {
-		shift := remain - suffixLen
-		b.suffixes[level][wordID] += suffix << shift
-	} else {
-		left := suffix >> (suffixLen - remain)
-		right := suffix << (wordSize - (suffixLen - remain))
-		b.suffixes[level][wordID] += left
-		b.suffixes[level] = append(b.suffixes[level], right)
+	b.suffixes[level][wordID] |= suffix << offset
+	if suffixLen > remain {
+		b.suffixes[level] = append(b.suffixes[level], suffix>>remain)
 	}
 	b.suffixCounts[level]++
 }
