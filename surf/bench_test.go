@@ -27,13 +27,13 @@ func benchmarkBuild(suite *SuRFTestSuite, b *testing.B) {
 	b.ReportAllocs()
 
 	for n := 0; n < b.N; n++ {
-		builder := NewBuilder(2, HashSuffix, 8, 0)
+		builder := NewBuilder(2, 8, 0)
 		builder.Build(suite.handles, suite.handles, 24)
 	}
 }
 
 func benchmarkGet(suite *SuRFTestSuite, b *testing.B) {
-	builder := NewBuilder(2, NoneSuffix, 4, 0)
+	builder := NewBuilder(2, 0, 0)
 	var surf SuRF
 	surf.Unmarshal(builder.bulk(suite.handles).Marshal())
 
@@ -44,7 +44,7 @@ func benchmarkGet(suite *SuRFTestSuite, b *testing.B) {
 }
 
 func benchmarkIteratorSeek(suite *SuRFTestSuite, b *testing.B) {
-	builder := NewBuilder(2, RealSuffix, 0, 4)
+	builder := NewBuilder(2, 0, 4)
 	var surf SuRF
 	surf.Unmarshal(builder.bulk(suite.handles).Marshal())
 	it := surf.NewIterator()
@@ -56,7 +56,7 @@ func benchmarkIteratorSeek(suite *SuRFTestSuite, b *testing.B) {
 }
 
 func benchmarkIteratorNext(suite *SuRFTestSuite, b *testing.B) {
-	builder := NewBuilder(2, RealSuffix, 0, 4)
+	builder := NewBuilder(2, 0, 4)
 	var surf SuRF
 	surf.Unmarshal(builder.bulk(suite.handles).Marshal())
 	it := surf.NewIterator()

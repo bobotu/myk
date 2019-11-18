@@ -65,15 +65,16 @@ type Builder struct {
 }
 
 // NewBuilder returns a new SuRF builder.
-func NewBuilder(valueSize uint32, suffixType SuffixType, hashSuffixLen, realSuffixLen uint32) *Builder {
-	switch suffixType {
-	case HashSuffix:
-		realSuffixLen = 0
-	case RealSuffix:
-		hashSuffixLen = 0
-	case NoneSuffix:
-		realSuffixLen = 0
-		hashSuffixLen = 0
+func NewBuilder(valueSize uint32, hashSuffixLen, realSuffixLen uint32) *Builder {
+	var suffixType SuffixType
+	if hashSuffixLen == 0 && realSuffixLen == 0 {
+		suffixType = NoneSuffix
+	} else if hashSuffixLen == 0 {
+		suffixType = RealSuffix
+	} else if realSuffixLen == 0 {
+		suffixType = HashSuffix
+	} else {
+		suffixType = MixedSuffix
 	}
 
 	return &Builder{

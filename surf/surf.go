@@ -20,39 +20,23 @@ func (s *SuRF) Get(key []byte) ([]byte, bool) {
 	return s.ls.Get(key, depth, uint32(cont))
 }
 
-// HasRange returns does SuRF contains key range [start, end).
-// An empty end key means no upper bound check.
-func (s *SuRF) HasRange(start, end []byte) bool {
+// HasOverlap returns does SuRF overlap with [start, end].
+func (s *SuRF) HasOverlap(start, end []byte, includeEnd bool) bool {
 	if s.ld.height == 0 && s.ls.height == 0 {
 		return false
 	}
 	it := s.NewIterator()
-	it.denseIter.Seek(start)
-	if !it.denseIter.valid {
-		return false
-	}
-	if !it.denseIter.IsComplete() {
-		if !it.denseIter.searchComp {
-			it.passToSparse()
-			it.sparseIter.Seek(start)
-			if !it.sparseIter.valid {
-				it.incrDenseIter()
-			}
-		} else if !it.denseIter.leftComp {
-			it.passToSparse()
-			it.sparseIter.MoveToLeftMostKey()
-		}
-	}
-
+	it.Seek(start)
 	if !it.Valid() {
 		return false
 	}
-	if len(end) == 0 {
-		return true
-	}
+
 	cmp := it.compare(end)
 	if cmp == couldBePositive {
-		return true
+		cmp = -1
+	}
+	if includeEnd {
+		return cmp <= 0
 	}
 	return cmp < 0
 }
@@ -135,7 +119,7 @@ func (it *Iterator) Prev() {
 	it.decrDenseIter()
 }
 
-// Seek move the iterator to the firest greater or equals to key.
+// Seek move the iterator to the first greater or equals to key.
 func (it *Iterator) Seek(key []byte) bool {
 	var fp bool
 	it.Reset()

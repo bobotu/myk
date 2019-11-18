@@ -94,7 +94,7 @@ func (suite *SuRFTestSuite) SetupSuite() {
 }
 
 func (suite *SuRFTestSuite) TestSingleKey() {
-	builder := NewBuilder(2, MixedSuffix, 2, 2)
+	builder := NewBuilder(2, 2, 2)
 	s := builder.Build([][]byte{{1, 2, 3, 4, 5, 6, 7, 8, 9}}, [][]byte{{1, 2}}, 10)
 	v, ok := s.Get([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9})
 	require.True(suite.T(), ok)
@@ -124,7 +124,7 @@ func (suite *SuRFTestSuite) TestTableRowKeyWithVaryTid() {
 						return bytes.Compare(a[i], a[j]) < 0
 					})
 
-					surf := NewBuilder(10, MixedSuffix, 4, 4).Build(a, a, 48)
+					surf := NewBuilder(10, 4, 4).Build(a, a, 48)
 
 					for i, k := range a {
 						v, ok := surf.Get(k)
@@ -157,7 +157,7 @@ func (suite *SuRFTestSuite) TestWithDatasets() {
 						return bytes.Compare(keys[i], keys[j]) < 0
 					})
 
-					surf := NewBuilder(3, MixedSuffix, 4, 4).Build(keys, keys, 48)
+					surf := NewBuilder(3, 4, 4).Build(keys, keys, 48)
 
 					for _, k := range keys {
 						v, ok := surf.Get(k)
@@ -189,7 +189,18 @@ func (suite *SuRFTestSuite) TestKeysExist() {
 			}
 
 			suite.Run(fmt.Sprintf("suffix=%s,suffixLen=%d", sf, sl), func() {
-				builder := NewBuilder(2, sf, sl, sl)
+				var hl, rl uint32
+				switch sf {
+				case HashSuffix:
+					hl, rl = sl, 0
+				case RealSuffix:
+					hl, rl = 0, sl
+				case MixedSuffix:
+					hl, rl = sl, sl
+				case NoneSuffix:
+					hl, rl = 0, 0
+				}
+				builder := NewBuilder(2, hl, rl)
 				t := suite.T()
 				t.Parallel()
 				surf := builder.bulk(suite.handles)
@@ -207,7 +218,7 @@ func (suite *SuRFTestSuite) TestKeysExist() {
 }
 
 func (suite *SuRFTestSuite) TestMarshal() {
-	builder := NewBuilder(2, MixedSuffix, 7, 5)
+	builder := NewBuilder(2, 7, 5)
 	surf := builder.bulk(suite.intKeys)
 	buf := surf.Marshal()
 	var surf1 SuRF
@@ -227,7 +238,7 @@ func (suite *SuRFTestSuite) TestIterator() {
 			suite.Run(name, func() {
 				t := suite.T()
 				t.Parallel()
-				builder := NewBuilder(2, NoneSuffix, 0, 0)
+				builder := NewBuilder(2, 0, 0)
 				surf := builder.bulk(data)
 				it := surf.NewIterator()
 
@@ -248,7 +259,7 @@ func (suite *SuRFTestSuite) TestIteratorReverse() {
 			suite.Run(name, func() {
 				t := suite.T()
 				t.Parallel()
-				builder := NewBuilder(2, NoneSuffix, 0, 0)
+				builder := NewBuilder(2, 0, 0)
 				surf := builder.bulk(data)
 				it := surf.NewIterator()
 
@@ -269,7 +280,7 @@ func (suite *SuRFTestSuite) TestIteratorSeekExist() {
 			suite.Run(name, func() {
 				t := suite.T()
 				t.Parallel()
-				builder := NewBuilder(2, NoneSuffix, 0, 0)
+				builder := NewBuilder(2, 0, 0)
 				surf := builder.bulk(data)
 				it := surf.NewIterator()
 
@@ -277,6 +288,13 @@ func (suite *SuRFTestSuite) TestIteratorSeekExist() {
 					it.Seek(k)
 					require.True(t, bytes.HasPrefix(data[i], it.Key()))
 					require.Equal(t, u16ToBytes(uint16(i)), it.Value())
+					if i+1 < len(data) {
+						cmp := it.compare(data[i+1])
+						if cmp == couldBePositive {
+							cmp = -1
+						}
+						require.Less(t, cmp, 0)
+					}
 				}
 			})
 		}(name, data)
@@ -292,7 +310,7 @@ func (suite *SuRFTestSuite) TestIteratorSeekAbsence() {
 		return bytes.Compare(keys[i], keys[j]) < 0
 	})
 	truc := suite.truncateSuffixes(keys)
-	builder := NewBuilder(2, RealSuffix, 0, 4)
+	builder := NewBuilder(2, 0, 4)
 	it := builder.bulk(keys).NewIterator()
 	t := suite.T()
 

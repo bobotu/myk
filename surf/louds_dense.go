@@ -62,7 +62,7 @@ func (ld *loudsDense) Get(key []byte) (sparseNode int64, depth uint32, value []b
 
 		pos = nodeID * denseFanout
 		if depth >= uint32(len(key)) {
-			if ld.isPrefixVec.IsSet(nodeID) {
+			if ok = ld.isPrefixVec.IsSet(nodeID); ok {
 				valPos := ld.suffixPos(pos, true)
 				if ok = ld.suffixes.CheckEquality(valPos, key, depth+1); ok {
 					value = ld.values.Get(valPos)
@@ -277,7 +277,7 @@ func (it *denseIter) Seek(key []byte) bool {
 		}
 
 		if prefixCmp < 0 {
-			if it.level == 0 {
+			if nodeID == 0 {
 				it.valid = false
 				return false
 			}
@@ -289,14 +289,18 @@ func (it *denseIter) Seek(key []byte) bool {
 		pos = nodeID * denseFanout
 		depth += uint32(len(prefix))
 		if depth >= uint32(len(key)) || prefixCmp > 0 {
-			it.append(it.ld.nextPos(pos - 1))
+			if pos > 0 {
+				it.append(it.ld.nextPos(pos - 1))
+			} else {
+				it.SetToFirstInRoot()
+			}
 			if it.ld.isPrefixVec.IsSet(nodeID) {
 				it.atPrefixKey = true
+				it.valid, it.searchComp, it.leftComp, it.rightComp = true, true, true, true
 			} else {
 				it.MoveToLeftMostKey()
 			}
-			it.valid, it.searchComp, it.leftComp, it.rightComp = true, true, true, true
-			return prefixCmp <= 0
+			return prefixCmp == 0
 		}
 
 		pos += uint32(key[depth])
@@ -315,6 +319,7 @@ func (it *denseIter) Seek(key []byte) bool {
 		nodeID = it.ld.childNodeID(pos)
 	}
 
+	it.level--
 	it.sendOutNodeID = nodeID
 	it.sendOutDepth = depth
 	it.valid, it.searchComp, it.leftComp, it.rightComp = true, false, true, true
@@ -335,16 +340,22 @@ func (it *denseIter) Value() []byte {
 
 func (it *denseIter) Compare(key []byte) int {
 	itKey := it.Key()
-	if it.atPrefixKey && len(itKey) < len(key) {
-		return -1
+
+	cmpLen := len(itKey)
+	if cmpLen > len(key) {
+		cmpLen = len(key)
+	}
+	cmp := bytes.Compare(itKey[:cmpLen], key[:cmpLen])
+	if cmp != 0 {
+		return cmp
 	}
 	if len(itKey) > len(key) {
 		return 1
 	}
-	cmp := bytes.Compare(itKey, key[:len(itKey)])
-	if cmp != 0 {
-		return cmp
+	if len(itKey) == len(key) && it.atPrefixKey {
+		return 0
 	}
+
 	if it.IsComplete() {
 		suffixPos := it.ld.suffixPos(it.posInTrie[it.level], it.atPrefixKey)
 		return it.ld.suffixes.Compare(key, suffixPos, uint32(len(itKey)))
