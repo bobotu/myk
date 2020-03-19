@@ -1,35 +1,6 @@
 package surf
 
-// SuffixType is SuRF's suffix type.
-type SuffixType uint8
-
-const (
-	// NoneSuffix means don't store suffix for keys.
-	NoneSuffix SuffixType = iota
-	// HashSuffix means store a small hash of keys.
-	HashSuffix
-	// RealSuffix means store a prefix of keys.
-	RealSuffix
-	// MixedSuffix means store a small hash with prefix of keys.
-	MixedSuffix
-)
-
-func (st SuffixType) String() string {
-	switch st {
-	case HashSuffix:
-		return "Hash"
-	case RealSuffix:
-		return "Real"
-	case MixedSuffix:
-		return "Mixed"
-	default:
-		return "None"
-	}
-}
-
-const labelTerminator = 0xff
-
-// Builder is the builder of SuRF.
+// Builder is builder of SuRF.
 type Builder struct {
 	sparseStartLevel uint32
 	valueSize        uint32
@@ -46,7 +17,6 @@ type Builder struct {
 	ldIsPrefix [][]uint64
 
 	// suffix
-	suffixType    SuffixType
 	hashSuffixLen uint32
 	realSuffixLen uint32
 	suffixes      [][]uint64
@@ -66,20 +36,8 @@ type Builder struct {
 
 // NewBuilder returns a new SuRF builder.
 func NewBuilder(valueSize uint32, hashSuffixLen, realSuffixLen uint32) *Builder {
-	var suffixType SuffixType
-	if hashSuffixLen == 0 && realSuffixLen == 0 {
-		suffixType = NoneSuffix
-	} else if hashSuffixLen == 0 {
-		suffixType = RealSuffix
-	} else if realSuffixLen == 0 {
-		suffixType = HashSuffix
-	} else {
-		suffixType = MixedSuffix
-	}
-
 	return &Builder{
 		valueSize:     valueSize,
-		suffixType:    suffixType,
 		hashSuffixLen: hashSuffixLen,
 		realSuffixLen: realSuffixLen,
 	}
@@ -94,19 +52,19 @@ func (b *Builder) Build(keys, vals [][]byte, bitsPerKeyHint int) *SuRF {
 	b.determineCutoffLevel(bitsPerKeyHint)
 	b.buildDense()
 
-	var prefixVec prefixVec
-	numItemsPerLevel := make([]uint32, b.treeHeight())
-	for level := range numItemsPerLevel {
-		numItemsPerLevel[level] = b.nodeCounts[level]
-	}
-	prefixVec.Init(b.hasPrefix, numItemsPerLevel, b.prefixes)
-
 	surf := new(SuRF)
 	surf.ld.Init(b)
 	surf.ls.Init(b)
 	return surf
 }
 
+// buildNodes is recursive algorithm to bulk building SuRF nodes.
+//	* We divide keys into groups by the `key[depth]`, so keys in each group shares the same prefix
+//	* If depth larger than the length if the first key in group, the key is prefix of others in group
+//	  So we should append `labelTerminator` to labels and update `b.isLastItemTerminator`, then remove it from group.
+//	* Scan over keys in current group when meets different label, use the new sub group call buildNodes with level+1 recursively
+//	* If all keys in current group have the same label, this node can be compressed, use this group call buildNodes with level recursively.
+//	* If current group contains only one key constract suffix of this key and return.
 func (b *Builder) buildNodes(keys, vals [][]byte, prefixDepth, depth, level int) {
 	b.ensureLevel(level)
 	nodeStartPos := b.numItems(level)
@@ -145,6 +103,7 @@ func (b *Builder) buildNodes(keys, vals [][]byte, prefixDepth, depth, level int)
 		groupStart = groupEnd
 	}
 
+	// check if current node contains compressed path.
 	if depth-prefixDepth > 0 {
 		prefix := keys[0][prefixDepth:depth]
 		setBit(b.hasPrefix[level], b.nodeCounts[level])
@@ -237,7 +196,7 @@ func (b *Builder) insertSuffix(key []byte, level, depth int) {
 	if level >= b.treeHeight() {
 		b.addLevel()
 	}
-	suffix := constructSuffix(key, uint32(depth)+1, b.suffixType, b.realSuffixLen, b.hashSuffixLen)
+	suffix := constructSuffix(key, uint32(depth)+1, b.realSuffixLen, b.hashSuffixLen)
 
 	suffixLen := b.suffixLen()
 	pos := b.suffixCounts[level] * suffixLen
@@ -282,6 +241,7 @@ func (b *Builder) determineCutoffLevel(bitsPerKeyHint int) {
 	}
 
 	var level int
+	// Begins from last level to make the height of dense levels as large as possible.
 	for level = height - 1; level > 0; level-- {
 		ds := b.denseSizeNoSuffix(level)
 		ss := b.sparseSizeNoSuffix(level)

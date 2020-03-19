@@ -11,7 +11,21 @@ const wordSize = 64
 
 var endian = binary.LittleEndian
 
-var selectInByteLut [256][8]int
+//  A precomputed tabled containing the positions of the set bits in the binary
+//  representations of all 8-bit unsigned integers.
+//
+//  For i: [0, 256) ranging over all 8-bit unsigned integers and for j: [0, 8)
+//  ranging over all 0-based bit positions in an 8-bit unsigned integer, the
+//  table entry selectInByteLut[i][j] is the 0-based bit position of the j-th set
+//  bit in the binary representation of i, or 8 if it has fewer than j set bits.
+//
+//  Example: i: 17 (b00010001), j: [0, 8)
+//    selectInByteLut[b00010001][0] = 0
+//    selectInByteLut[b00010001][1] = 4
+//    selectInByteLut[b00010001][2] = 8
+//    ...
+//    selectInByteLut[b00010001][7] = 8
+var selectInByteLut [256][8]uint8
 
 func init() {
 	for i := 0; i < 256; i++ {
@@ -22,10 +36,10 @@ func init() {
 }
 
 func findFirstSet(x int) int {
-	return bits.TrailingZeros64(uint64(x&-x)) + 1
+	return bits.TrailingZeros64(uint64(x)) + 1
 }
 
-func selectInByte(i, j int) int {
+func selectInByte(i, j int) uint8 {
 	r := 0
 	for ; j != 0; j-- {
 		s := findFirstSet(i)
@@ -35,7 +49,7 @@ func selectInByte(i, j int) int {
 	if i == 0 {
 		return 8
 	}
-	return r + findFirstSet(i) - 1
+	return uint8(r + findFirstSet(i) - 1)
 }
 
 func select64Broadword(x uint64, nth int64) int64 {
@@ -56,7 +70,7 @@ func select64Broadword(x uint64, nth int64) int64 {
 	geqKStep8 := ((step8 | msbsStep8) - byteSums) & msbsStep8
 	place := bits.OnesCount64(geqKStep8) * 8
 	byteRank := k - (((byteSums << 8) >> place) & uint64(0xff))
-	return int64(place + selectInByteLut[(x>>place)&0xff][byteRank])
+	return int64(place + int(selectInByteLut[(x>>place)&0xff][byteRank]))
 }
 
 func popcountBlock(bs []uint64, off, nbits uint32) uint32 {

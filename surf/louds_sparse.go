@@ -16,7 +16,7 @@ type loudsSparse struct {
 	loudsVec    selectVector
 	suffixes    suffixVector
 	values      valueVector
-	prefixVec   prefixVec
+	prefixVec   prefixVector
 }
 
 func (ls *loudsSparse) Init(builder *Builder) *loudsSparse {
@@ -40,7 +40,7 @@ func (ls *loudsSparse) Init(builder *Builder) *loudsSparse {
 	ls.hasChildVec.Init(builder.lsHasChild[ls.startLevel:], numItemsPerLevel)
 	ls.loudsVec.Init(builder.lsLoudsBits[ls.startLevel:], numItemsPerLevel)
 
-	if builder.suffixType != NoneSuffix {
+	if builder.suffixLen() != 0 {
 		hashLen := builder.hashSuffixLen
 		realLen := builder.realSuffixLen
 		suffixLen := hashLen + realLen
@@ -48,7 +48,7 @@ func (ls *loudsSparse) Init(builder *Builder) *loudsSparse {
 		for i := range numSuffixBitsPerLevel {
 			numSuffixBitsPerLevel[i] = builder.suffixCounts[int(ls.startLevel)+i] * suffixLen
 		}
-		ls.suffixes.Init(builder.suffixType, hashLen, realLen, builder.suffixes[ls.startLevel:], numSuffixBitsPerLevel)
+		ls.suffixes.Init(hashLen, realLen, builder.suffixes[ls.startLevel:], numSuffixBitsPerLevel)
 	}
 
 	ls.values.Init(builder.values[ls.startLevel:], builder.valueSize)
@@ -106,7 +106,8 @@ func (ls *loudsSparse) MarshalSize() int64 {
 }
 
 func (ls *loudsSparse) rawMarshalSize() int64 {
-	return 4*4 + ls.labelVec.MarshalSize() + ls.hasChildVec.MarshalSize() + ls.loudsVec.MarshalSize() + ls.suffixes.MarshalSize() + ls.prefixVec.MarshalSize()
+	return 4*4 + ls.labelVec.MarshalSize() + ls.hasChildVec.MarshalSize() + ls.loudsVec.MarshalSize() +
+		ls.suffixes.MarshalSize() + ls.prefixVec.MarshalSize()
 }
 
 func (ls *loudsSparse) WriteTo(w io.Writer) error {
@@ -356,29 +357,29 @@ func (it *sparseIter) Compare(key []byte) int {
 		panic("dense compare have bug")
 	}
 	if startDepth == len(key) {
-		if it.atTerminator {
+		if len(itKey) == 0 {
 			return 0
 		}
 		return 1
 	}
-	key = key[startDepth:]
+	cmpKey := key[startDepth:]
 
 	cmpLen := len(itKey)
-	if cmpLen > len(key) {
-		cmpLen = len(key)
+	if cmpLen > len(cmpKey) {
+		cmpLen = len(cmpKey)
 	}
-	cmp := bytes.Compare(itKey[:cmpLen], key[:cmpLen])
+	cmp := bytes.Compare(itKey[:cmpLen], cmpKey[:cmpLen])
 	if cmp != 0 {
 		return cmp
 	}
-	if len(itKey) > len(key) {
+	if len(itKey) > len(cmpKey) {
 		return 1
 	}
-	if len(itKey) == len(key) && it.atTerminator {
+	if len(itKey) == len(cmpKey) && it.atTerminator {
 		return 0
 	}
 	suffixPos := it.ls.suffixPos(it.posInTrie[it.level])
-	return it.ls.suffixes.Compare(key, suffixPos, uint32(len(itKey)))
+	return it.ls.suffixes.Compare(key, suffixPos, uint32(len(itKey)+startDepth))
 }
 
 func (it *sparseIter) Reset() {
@@ -463,13 +464,12 @@ func (it *sparseIter) MoveToRightMostKey() {
 }
 
 func (it *sparseIter) SetToFirstInRoot() {
-	it.posInTrie[0] = 0
-	it.keyBuf = append(it.keyBuf[:0], it.ls.labelVec.GetLabel(0))
+	it.append(it.ls.labelVec.GetLabel(0), 0, it.startNodeID)
 }
 
 func (it *sparseIter) SetToLastInRoot() {
-	it.posInTrie[0] = it.ls.lastLabelPos(0)
-	it.keyBuf = append(it.keyBuf[:0], it.ls.labelVec.GetLabel(it.posInTrie[0]))
+	pos := it.ls.lastLabelPos(0)
+	it.append(it.ls.labelVec.GetLabel(pos), pos, it.startNodeID)
 }
 
 func (it *sparseIter) append(label byte, pos, nodeID uint32) {

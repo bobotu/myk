@@ -5,7 +5,6 @@ import (
 	"io"
 )
 
-// SuRF is a fast succinct trie.
 type SuRF struct {
 	ld loudsDense
 	ls loudsSparse
@@ -44,11 +43,6 @@ func (s *SuRF) HasOverlap(start, end []byte, includeEnd bool) bool {
 // MarshalSize returns the size of SuRF after serialization.
 func (s *SuRF) MarshalSize() int64 {
 	return s.ld.MarshalSize() + s.ls.MarshalSize() + s.ld.values.MarshalSize() + s.ls.values.MarshalSize()
-}
-
-// MarshalNoValueSize returns the size of index part in SuRF after serialization.
-func (s *SuRF) MarshalNoValueSize() int64 {
-	return s.ld.MarshalSize() + s.ls.MarshalSize()
 }
 
 // Marshal returns the serialized SuRF.
@@ -100,6 +94,9 @@ func (s *SuRF) NewIterator() *Iterator {
 
 // Valid returns the valid status of iterator.
 func (it *Iterator) Valid() bool {
+	if it.denseIter.ld.height == 0 {
+		return it.sparseIter.valid
+	}
 	return it.denseIter.valid && (it.denseIter.IsComplete() || it.sparseIter.valid)
 }
 

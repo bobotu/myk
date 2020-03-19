@@ -433,6 +433,8 @@ func (v *rankVectorSparse) Rank(pos uint32) uint32 {
 	return v.rankLut[blockOff] + popcountBlock(v.bits, blockOff*wordPreBlk, bitsOff+1)
 }
 
+const labelTerminator = 0xff
+
 type labelVector struct {
 	labels []byte
 }
@@ -455,7 +457,8 @@ func (v *labelVector) GetLabel(pos uint32) byte {
 	return v.labels[pos]
 }
 
-func (v *labelVector) Search(k byte, start, size uint32) (uint32, bool) {
+func (v *labelVector) Search(k byte, off, size uint32) (uint32, bool) {
+	start := off
 	if size > 1 && v.labels[start] == labelTerminator {
 		start++
 		size--
@@ -467,7 +470,7 @@ func (v *labelVector) Search(k byte, start, size uint32) (uint32, bool) {
 	}
 	result := bytes.IndexByte(v.labels[start:end], k)
 	if result < 0 {
-		return start, false
+		return off, false
 	}
 	return start + uint32(result), true
 }
@@ -515,127 +518,30 @@ func (v *labelVector) Unmarshal(buf []byte) []byte {
 	return buf[align(int64(4+l)):]
 }
 
-type prefixVec struct {
-	hasPrefixVec  rankVectorSparse
-	prefixOffsets []byte
-	prefixData    []byte
-}
+const (
+	hashShift       = 7
+	couldBePositive = 2
+)
 
-func (v *prefixVec) Init(hasPrefixBits [][]uint64, numNodesPerLevel []uint32, prefixes [][][]byte) {
-	v.hasPrefixVec.Init(hasPrefixBits, numNodesPerLevel)
-
-	var offset uint32
-	for _, level := range prefixes {
-		for _, prefix := range level {
-			var buf [4]byte
-			endian.PutUint32(buf[:], offset)
-			v.prefixOffsets = append(v.prefixOffsets, buf[:]...)
-			offset += uint32(len(prefix))
-			v.prefixData = append(v.prefixData, prefix...)
-		}
-	}
-}
-
-func (v *prefixVec) CheckPrefix(key []byte, depth uint32, nodeID uint32) (uint32, bool) {
-	prefix := v.GetPrefix(nodeID)
-	if len(prefix) == 0 {
-		return 0, true
-	}
-
-	if int(depth)+len(prefix) > len(key) {
-		return 0, false
-	}
-	if !bytes.Equal(key[depth:depth+uint32(len(prefix))], prefix) {
-		return 0, false
-	}
-	return uint32(len(prefix)), true
-}
-
-func (v *prefixVec) GetPrefix(nodeID uint32) []byte {
-	if !v.hasPrefixVec.IsSet(nodeID) {
-		return nil
-	}
-
-	prefixID := v.hasPrefixVec.Rank(nodeID) - 1
-	start := endian.Uint32(v.prefixOffsets[prefixID*4:])
-	end := uint32(len(v.prefixData))
-	if int((prefixID+1)*4) < len(v.prefixOffsets) {
-		end = endian.Uint32(v.prefixOffsets[(prefixID+1)*4:])
-	}
-	return v.prefixData[start:end]
-}
-
-func (v *prefixVec) WriteTo(w io.Writer) error {
-	if err := v.hasPrefixVec.WriteTo(w); err != nil {
-		return err
-	}
-
-	var length [8]byte
-	endian.PutUint32(length[:4], uint32(len(v.prefixOffsets)))
-	endian.PutUint32(length[4:], uint32(len(v.prefixData)))
-
-	if _, err := w.Write(length[:]); err != nil {
-		return err
-	}
-	if _, err := w.Write(v.prefixOffsets); err != nil {
-		return err
-	}
-	if _, err := w.Write(v.prefixData); err != nil {
-		return err
-	}
-
-	padding := v.MarshalSize() - v.rawMarshalSize()
-	var zeros [8]byte
-	_, err := w.Write(zeros[:padding])
-	return err
-}
-
-func (v *prefixVec) Unmarshal(b []byte) []byte {
-	buf1 := v.hasPrefixVec.Unmarshal(b)
-	var cursor int64
-	offsetsLen := int64(endian.Uint32(buf1[cursor:]))
-	cursor += 4
-	dataLen := int64(endian.Uint32(buf1[cursor:]))
-	cursor += 4
-
-	v.prefixOffsets = buf1[cursor : cursor+offsetsLen]
-	cursor += offsetsLen
-	v.prefixData = buf1[cursor : cursor+dataLen]
-
-	return b[v.MarshalSize():]
-}
-
-func (v *prefixVec) rawMarshalSize() int64 {
-	return v.hasPrefixVec.MarshalSize() + 8 + int64(len(v.prefixOffsets)+len(v.prefixData))
-}
-
-func (v *prefixVec) MarshalSize() int64 {
-	return align(v.rawMarshalSize())
-}
-
-const hashShift = 7
-
-// Max suffix_len_ = 64 bits
-// For kReal suffixes, if the stored key is not long enough to provide
-// suffix_len_ suffix bits, its suffix field is cleared (i.e., all 0's)
+// max(hashSuffixLen + realSuffixLen) = 64 bits
+// For real suffixes, if the stored key is not long enough to provide
+// realSuffixLen suffix bits, its suffix field is cleared (i.e., all 0's)
 // to indicate that there is no suffix info associated with the key.
 type suffixVector struct {
 	bitVector
-	suffixType    SuffixType
 	hashSuffixLen uint32
 	realSuffixLen uint32
 }
 
-func (v *suffixVector) Init(suffixType SuffixType, hashLen, realLen uint32, bitsPerLevel [][]uint64, numBitsPerLevel []uint32) *suffixVector {
+func (v *suffixVector) Init(hashLen, realLen uint32, bitsPerLevel [][]uint64, numBitsPerLevel []uint32) *suffixVector {
 	v.bitVector.Init(bitsPerLevel, numBitsPerLevel)
-	v.suffixType = suffixType
 	v.hashSuffixLen = hashLen
 	v.realSuffixLen = realLen
 	return v
 }
 
 func (v *suffixVector) CheckEquality(idx uint32, key []byte, level uint32) bool {
-	if v.suffixType == NoneSuffix {
+	if !v.hasSuffix() {
 		return true
 	}
 	if idx*v.suffixLen() >= v.numBits {
@@ -643,7 +549,7 @@ func (v *suffixVector) CheckEquality(idx uint32, key []byte, level uint32) bool 
 	}
 
 	suffix := v.read(idx)
-	if v.suffixType == RealSuffix {
+	if v.isRealSuffix() {
 		if suffix == 0 {
 			return true
 		}
@@ -651,26 +557,25 @@ func (v *suffixVector) CheckEquality(idx uint32, key []byte, level uint32) bool 
 			return false
 		}
 	}
-	expected := constructSuffix(key, level, v.suffixType, v.realSuffixLen, v.hashSuffixLen)
+	expected := constructSuffix(key, level, v.realSuffixLen, v.hashSuffixLen)
 	return suffix == expected
 }
 
-const couldBePositive = 2
-
 func (v *suffixVector) Compare(key []byte, idx, level uint32) int {
-	if idx*v.suffixLen() >= v.numBits || v.suffixType == NoneSuffix || v.suffixType == HashSuffix {
+	if idx*v.suffixLen() >= v.numBits || v.realSuffixLen == 0 {
 		return couldBePositive
 	}
 
 	suffix := v.read(idx)
-	if v.suffixType == MixedSuffix {
+	if v.isMixedSuffix() {
 		suffix = extractRealSuffix(suffix, v.realSuffixLen)
 	}
 	expected := constructRealSuffix(key, level, v.realSuffixLen)
 
-	if suffix == 0 && expected == 0 {
+	if suffix == 0 || expected == 0 {
+		// Key length is not long enough to provide suffix, cannot determin which one is the larger one.
 		return couldBePositive
-	} else if suffix == 0 || suffix < expected {
+	} else if suffix < expected {
 		return -1
 	} else if suffix == expected {
 		return couldBePositive
@@ -684,16 +589,13 @@ func (v *suffixVector) MarshalSize() int64 {
 }
 
 func (v *suffixVector) rawMarshalSize() int64 {
-	return 4 + 1 + 4 + 4 + int64(v.bitsSize())
+	return 4 + 4 + 4 + int64(v.bitsSize())
 }
 
 func (v *suffixVector) WriteTo(w io.Writer) error {
 	var buf [4]byte
 	endian.PutUint32(buf[:], v.numBits)
 	if _, err := w.Write(buf[:]); err != nil {
-		return err
-	}
-	if _, err := w.Write([]byte{byte(v.suffixType)}); err != nil {
 		return err
 	}
 	endian.PutUint32(buf[:], v.hashSuffixLen)
@@ -718,13 +620,11 @@ func (v *suffixVector) Unmarshal(buf []byte) []byte {
 	var cursor int64
 	v.numBits = endian.Uint32(buf)
 	cursor += 4
-	v.suffixType = SuffixType(buf[cursor])
-	cursor += 1
 	v.hashSuffixLen = endian.Uint32(buf[cursor:])
 	cursor += 4
 	v.realSuffixLen = endian.Uint32(buf[cursor:])
 	cursor += 4
-	if v.suffixType != NoneSuffix {
+	if v.hasSuffix() {
 		bitsSize := int64(v.bitsSize())
 		v.bits = bytesToU64Slice(buf[cursor : cursor+bitsSize])
 		cursor += bitsSize
@@ -751,17 +651,33 @@ func (v *suffixVector) suffixLen() uint32 {
 	return v.hashSuffixLen + v.realSuffixLen
 }
 
-func constructSuffix(key []byte, level uint32, suffixType SuffixType, realSuffixLen, hashSuffixLen uint32) uint64 {
-	switch suffixType {
-	case HashSuffix:
-		return constructHashSuffix(key, hashSuffixLen)
-	case RealSuffix:
-		return constructRealSuffix(key, level, realSuffixLen)
-	case MixedSuffix:
-		return constructMixedSuffix(key, level, realSuffixLen, hashSuffixLen)
-	default:
+func (v *suffixVector) hasSuffix() bool {
+	return v.realSuffixLen != 0 || v.hashSuffixLen != 0
+}
+
+func (v *suffixVector) isHashSuffix() bool {
+	return v.realSuffixLen == 0 && v.hashSuffixLen != 0
+}
+
+func (v *suffixVector) isRealSuffix() bool {
+	return v.realSuffixLen != 0 && v.hashSuffixLen == 0
+}
+
+func (v *suffixVector) isMixedSuffix() bool {
+	return v.realSuffixLen != 0 && v.hashSuffixLen != 0
+}
+
+func constructSuffix(key []byte, level uint32, realSuffixLen, hashSuffixLen uint32) uint64 {
+	if hashSuffixLen == 0 && realSuffixLen == 0 {
 		return 0
 	}
+	if realSuffixLen == 0 {
+		return constructHashSuffix(key, hashSuffixLen)
+	}
+	if hashSuffixLen == 0 {
+		return constructRealSuffix(key, level, realSuffixLen)
+	}
+	return constructMixedSuffix(key, level, realSuffixLen, hashSuffixLen)
 }
 
 func constructHashSuffix(key []byte, hashSuffixLen uint32) uint64 {
@@ -807,4 +723,100 @@ func constructMixedSuffix(key []byte, level, realSuffixLen, hashSuffixLen uint32
 func extractRealSuffix(suffix uint64, suffixLen uint32) uint64 {
 	mask := (uint64(1) << suffixLen) - 1
 	return suffix & mask
+}
+
+type prefixVector struct {
+	hasPrefixVec  rankVectorSparse
+	prefixOffsets []uint32
+	prefixData    []byte
+}
+
+func (v *prefixVector) Init(hasPrefixBits [][]uint64, numNodesPerLevel []uint32, prefixes [][][]byte) {
+	v.hasPrefixVec.Init(hasPrefixBits, numNodesPerLevel)
+
+	var offset uint32
+	for _, level := range prefixes {
+		for _, prefix := range level {
+			v.prefixOffsets = append(v.prefixOffsets, offset)
+			offset += uint32(len(prefix))
+			v.prefixData = append(v.prefixData, prefix...)
+		}
+	}
+}
+
+func (v *prefixVector) CheckPrefix(key []byte, depth uint32, nodeID uint32) (uint32, bool) {
+	prefix := v.GetPrefix(nodeID)
+	if len(prefix) == 0 {
+		return 0, true
+	}
+
+	if int(depth)+len(prefix) > len(key) {
+		return 0, false
+	}
+	if !bytes.Equal(key[depth:depth+uint32(len(prefix))], prefix) {
+		return 0, false
+	}
+	return uint32(len(prefix)), true
+}
+
+func (v *prefixVector) GetPrefix(nodeID uint32) []byte {
+	if !v.hasPrefixVec.IsSet(nodeID) {
+		return nil
+	}
+
+	prefixID := v.hasPrefixVec.Rank(nodeID) - 1
+	start := v.prefixOffsets[prefixID]
+	end := uint32(len(v.prefixData))
+	if int(prefixID+1) < len(v.prefixOffsets) {
+		end = v.prefixOffsets[prefixID+1]
+	}
+	return v.prefixData[start:end]
+}
+
+func (v *prefixVector) WriteTo(w io.Writer) error {
+	if err := v.hasPrefixVec.WriteTo(w); err != nil {
+		return err
+	}
+
+	var length [8]byte
+	endian.PutUint32(length[:4], uint32(len(v.prefixOffsets)*4))
+	endian.PutUint32(length[4:], uint32(len(v.prefixData)))
+
+	if _, err := w.Write(length[:]); err != nil {
+		return err
+	}
+	if _, err := w.Write(u32SliceToBytes(v.prefixOffsets)); err != nil {
+		return err
+	}
+	if _, err := w.Write(v.prefixData); err != nil {
+		return err
+	}
+
+	padding := v.MarshalSize() - v.rawMarshalSize()
+	var zeros [8]byte
+	_, err := w.Write(zeros[:padding])
+	return err
+}
+
+func (v *prefixVector) Unmarshal(b []byte) []byte {
+	buf1 := v.hasPrefixVec.Unmarshal(b)
+	var cursor int64
+	offsetsLen := int64(endian.Uint32(buf1[cursor:]))
+	cursor += 4
+	dataLen := int64(endian.Uint32(buf1[cursor:]))
+	cursor += 4
+
+	v.prefixOffsets = bytesToU32Slice(buf1[cursor : cursor+offsetsLen])
+	cursor += offsetsLen
+	v.prefixData = buf1[cursor : cursor+dataLen]
+
+	return b[v.MarshalSize():]
+}
+
+func (v *prefixVector) rawMarshalSize() int64 {
+	return v.hasPrefixVec.MarshalSize() + 8 + int64(len(v.prefixOffsets)*4+len(v.prefixData))
+}
+
+func (v *prefixVector) MarshalSize() int64 {
+	return align(v.rawMarshalSize())
 }

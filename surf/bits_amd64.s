@@ -1,6 +1,4 @@
-#include "textflag.h"
-
-TEXT ·select64(SB),NOSPLIT,$24-24
+TEXT ·select64(SB),$24-24
     MOVQ    x+0(FP), AX
     MOVQ    k+8(FP), CX
     CMPB    ·hasBMI2(SB), $0

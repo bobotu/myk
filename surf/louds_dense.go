@@ -16,7 +16,7 @@ type loudsDense struct {
 	isPrefixVec rankVectorDense
 	suffixes    suffixVector
 	values      valueVector
-	prefixVec   prefixVec
+	prefixVec   prefixVector
 
 	// height is dense end level.
 	height uint32
@@ -34,7 +34,7 @@ func (ld *loudsDense) Init(builder *Builder) *loudsDense {
 	ld.hasChildVec.Init(builder.ldHasChild[:ld.height], numBitsPerLevel)
 	ld.isPrefixVec.Init(builder.ldIsPrefix[:ld.height], builder.nodeCounts)
 
-	if builder.suffixType != NoneSuffix {
+	if builder.suffixLen() != 0 {
 		hashLen := builder.hashSuffixLen
 		realLen := builder.realSuffixLen
 		suffixLen := hashLen + realLen
@@ -42,7 +42,7 @@ func (ld *loudsDense) Init(builder *Builder) *loudsDense {
 		for i := range numSuffixBitsPerLevel {
 			numSuffixBitsPerLevel[i] = builder.suffixCounts[i] * suffixLen
 		}
-		ld.suffixes.Init(builder.suffixType, hashLen, realLen, builder.suffixes[:ld.height], numSuffixBitsPerLevel)
+		ld.suffixes.Init(hashLen, realLen, builder.suffixes[:ld.height], numSuffixBitsPerLevel)
 	}
 
 	ld.values.Init(builder.values[:ld.height], builder.valueSize)
@@ -163,7 +163,7 @@ func (ld *loudsDense) nextPos(pos uint32) uint32 {
 
 func (ld *loudsDense) prevPos(pos uint32) (uint32, bool) {
 	dist := ld.labelVec.DistanceToPrevSetBit(pos)
-	if pos <= dist {
+	if pos < dist {
 		return 0, true
 	}
 	return pos - dist, false

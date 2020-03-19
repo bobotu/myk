@@ -3,6 +3,7 @@ package surf
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -14,41 +15,41 @@ func TestBitsVecTestSuite(t *testing.T) {
 	suite.Run(t, new(BitsVecTestSuite))
 }
 
-func (suite *BitsVecTestSuite) TestSelect64() {
+func TestSelect64(t *testing.T) {
 	cases := [][]uint64{
 		{0, 3, 1},
 		{33, 3 << 32, 2},
 		{63, 1 << 63, 1},
 		{9, 0b11101011001010101, 5},
 	}
-	suite.Run("broadword", func() {
+	t.Run("broadword", func(t *testing.T) {
 		for _, c := range cases {
-			suite.Require().EqualValues(c[0], select64Broadword(c[1], int64(c[2])))
+			require.EqualValues(t, c[0], select64Broadword(c[1], int64(c[2])))
 		}
 	})
-	suite.Run("bmi2", func() {
+	t.Run("bmi2", func(t *testing.T) {
 		for _, c := range cases {
-			suite.Require().EqualValues(c[0], select64(c[1], int64(c[2])))
+			require.EqualValues(t, c[0], select64(c[1], int64(c[2])))
 		}
 	})
-	suite.Run("fallback", func() {
+	t.Run("fallback", func(t *testing.T) {
 		hasBMI2 = false
 		for _, c := range cases {
-			suite.Require().EqualValues(c[0], select64(c[1], int64(c[2])))
+			require.EqualValues(t, c[0], select64(c[1], int64(c[2])))
 		}
 		hasBMI2 = true
 	})
 }
 
-func (suite *BitsVecTestSuite) TestBitSetAndRead() {
+func TestBitSetAndRead(t *testing.T) {
 	for i := 0; i < 128; i++ {
 		var bits [2]uint64
 		setBit(bits[:], uint32(i))
-		suite.Require().True(readBit(bits[:], uint32(i)))
+		require.True(t, readBit(bits[:], uint32(i)))
 	}
 }
 
-func (suite *BitsVecTestSuite) TestPopCount() {
+func TestPopCount(t *testing.T) {
 	cases := [][]int{
 		{0, 1, 2, 3, 4},
 		{0, 2, 16, 17, 33, 62},
@@ -58,13 +59,13 @@ func (suite *BitsVecTestSuite) TestPopCount() {
 	}
 
 	for _, c := range cases {
-		bits, nbits := suite.constructBits(c)
-		suite.Require().EqualValues(len(c), popcountBlock(bits, 0, nbits))
-		suite.Require().EqualValues(len(c)-1, popcountBlock(bits, 0, nbits-1))
+		bits, nbits := constructBits(c)
+		require.EqualValues(t, len(c), popcountBlock(bits, 0, nbits))
+		require.EqualValues(t, len(c)-1, popcountBlock(bits, 0, nbits-1))
 	}
 }
 
-func (suite *BitsVecTestSuite) TestBitVector() {
+func TestBitVector(t *testing.T) {
 	cases := [][][]int{
 		{
 			{0, 1, 24, 60},
@@ -84,7 +85,7 @@ func (suite *BitsVecTestSuite) TestBitVector() {
 		numBitsPerLevel := make([]uint32, len(c))
 		bitsPerLevel := make([][]uint64, len(c))
 		for l, p := range c {
-			bitsPerLevel[l], numBitsPerLevel[l] = suite.constructBits(p)
+			bitsPerLevel[l], numBitsPerLevel[l] = constructBits(p)
 		}
 		vec.Init(bitsPerLevel, numBitsPerLevel)
 
@@ -92,42 +93,36 @@ func (suite *BitsVecTestSuite) TestBitVector() {
 		for l, p := range c {
 			for i, pos := range p {
 				idx := off + uint32(pos)
-				{
-					suite.Require().True(vec.IsSet(idx))
-				}
-				{
-					dist := vec.DistanceToNextSetBit(idx)
-					var expected int
-					if i == len(p)-1 {
-						if l < len(c)-1 {
-							expected = c[l+1][0] + 1
-						} else {
-							expected = 1
-						}
-					} else {
-						expected = p[i+1] - pos
-					}
 
-					suite.Require().EqualValues(expected, dist)
-				}
-				{
-					dist := vec.DistanceToPrevSetBit(idx)
-					var expected int
-					if i == 0 {
-						expected = pos + 1
-					} else {
-						expected = pos - p[i-1]
-					}
+				require.True(t, vec.IsSet(idx))
 
-					suite.Require().EqualValuesf(expected, dist, "level %d, pos %d", l, pos)
+				dist := vec.DistanceToNextSetBit(idx)
+				var expected int
+				if i == len(p)-1 {
+					if l < len(c)-1 {
+						expected = c[l+1][0] + 1
+					} else {
+						expected = 1
+					}
+				} else {
+					expected = p[i+1] - pos
 				}
+				require.EqualValues(t, expected, dist)
+
+				dist = vec.DistanceToPrevSetBit(idx)
+				if i == 0 {
+					expected = pos + 1
+				} else {
+					expected = pos - p[i-1]
+				}
+				require.EqualValuesf(t, expected, dist, "level %d, pos %d", l, pos)
 			}
 			off += numBitsPerLevel[l]
 		}
 	}
 }
 
-func (suite *BitsVecTestSuite) TestSelectVector() {
+func TestSelectVector(t *testing.T) {
 	cases := [][][]int{
 		{
 			{0, 1, 24, 60},
@@ -147,7 +142,7 @@ func (suite *BitsVecTestSuite) TestSelectVector() {
 		numBitsPerLevel := make([]uint32, len(c))
 		bitsPerLevel := make([][]uint64, len(c))
 		for l, p := range c {
-			bitsPerLevel[l], numBitsPerLevel[l] = suite.constructBits(p)
+			bitsPerLevel[l], numBitsPerLevel[l] = constructBits(p)
 		}
 		vec.Init(bitsPerLevel, numBitsPerLevel)
 
@@ -157,7 +152,7 @@ func (suite *BitsVecTestSuite) TestSelectVector() {
 				idx := off + uint32(pos)
 				sr := vec.Select(rank)
 
-				suite.Require().EqualValuesf(idx, sr, "level: %d, pos: %d, rank: %d", l, pos, rank)
+				require.EqualValuesf(t, idx, sr, "level: %d, pos: %d, rank: %d", l, pos, rank)
 				rank++
 			}
 			off += numBitsPerLevel[l]
@@ -165,28 +160,7 @@ func (suite *BitsVecTestSuite) TestSelectVector() {
 	}
 }
 
-func (suite *BitsVecTestSuite) TestLabelVecSearch() {
-	labels := [][]byte{
-		{1},
-		{2, 3},
-		{4, 5, 6},
-		{labelTerminator, 7, 8, 9},
-	}
-	v := new(labelVector)
-	v.Init(labels, 0, uint32(len(labels)))
-	suite.labelShouldExist(v, 1, 0, 1, 0)
-	suite.labelShouldExist(v, 3, 0, 5, 2)
-	suite.labelShouldExist(v, 5, 3, 7, 4)
-	suite.labelShouldExist(v, 7, 6, 8, 7)
-}
-
-func (suite *BitsVecTestSuite) labelShouldExist(v *labelVector, k byte, start, size, pos uint32) {
-	r, ok := v.Search(k, start, size)
-	suite.Require().True(ok)
-	suite.Require().Equal(pos, r)
-}
-
-func (suite *BitsVecTestSuite) constructBits(sets []int) ([]uint64, uint32) {
+func constructBits(sets []int) ([]uint64, uint32) {
 	nbits := sets[len(sets)-1] + 1
 	words := nbits / wordSize
 	if nbits%wordSize != 0 {
@@ -206,9 +180,29 @@ func BenchmarkSelect64(b *testing.B) {
 		}
 	})
 
-	b.Run("binary", func(b *testing.B) {
+	b.Run("fallback", func(b *testing.B) {
 		for n := 0; n < b.N; n++ {
 			select64Broadword(0b01101010101011110111101011001010101, 10)
 		}
 	})
+}
+
+func TestLabelVecSearch(t *testing.T) {
+	labels := [][]byte{
+		{1},
+		{2, 3},
+		{4, 5, 6},
+		{labelTerminator, 7, 8, 9},
+	}
+	v := new(labelVector)
+	v.Init(labels, 0, uint32(len(labels)))
+	labelShouldExist := func(k byte, start, size, pos uint32) {
+		r, ok := v.Search(k, start, size)
+		require.True(t, ok)
+		require.Equal(t, pos, r)
+	}
+	labelShouldExist(1, 0, 1, 0)
+	labelShouldExist(3, 0, 5, 2)
+	labelShouldExist(5, 3, 7, 4)
+	labelShouldExist(7, 6, 8, 7)
 }
