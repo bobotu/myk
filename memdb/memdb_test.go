@@ -18,18 +18,17 @@ func TestT(t *testing.T) {
 func (db *memdb) get4Test(key uint32) (uint32, bool) {
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], uint32(key))
-	_, xn := db.tranverse(buf[:], false)
-	if xn == nil {
+	v, ok := db.Get(buf[:])
+	if !ok {
 		return 0, false
 	}
-	return xn.vptr.off, true
+	return binary.BigEndian.Uint32(v), true
 }
 
 func (db *memdb) set4Test(key, value uint32) {
 	var buf [4]byte
 	binary.BigEndian.PutUint32(buf[:], uint32(key))
-	_, xn := db.tranverse(buf[:], true)
-	xn.vptr.off = value
+	db.Set(buf[:], buf[:])
 }
 
 func (db *memdb) del4Test(key uint32) {

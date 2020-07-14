@@ -2,7 +2,6 @@ package memdb
 
 import (
 	"math"
-	"unsafe"
 )
 
 const (
@@ -27,37 +26,6 @@ func (addr arenaAddr) isNull() bool {
 type arena struct {
 	blockSize int
 	blocks    []arenaBlock
-	nullNode  memdbNode
-}
-
-func (a *arena) init() {
-	a.nullNode = memdbNode{
-		up:    nullAddr,
-		left:  nullAddr,
-		right: nullAddr,
-		vptr:  nullAddr,
-	}
-}
-
-func (a *arena) getNode(addr arenaAddr) *memdbNode {
-	if addr.isNull() {
-		return &a.nullNode
-	}
-
-	return (*memdbNode)(unsafe.Pointer(&a.blocks[addr.idx].buf[addr.off]))
-}
-
-func (a *arena) allocNode(key []byte) (arenaAddr, *memdbNode) {
-	nodeSize := 8*4 + 2 + 1 + len(key)
-	addr, mem := a.alloc(nodeSize)
-	n := (*memdbNode)(unsafe.Pointer(&mem[0]))
-	n.klen = uint16(len(key))
-	copy(n.getKey(), key)
-	return addr, n
-}
-
-func (a *arena) freeNode(addr arenaAddr) {
-	// TODO: we can reuse node's space.
 }
 
 func (a *arena) alloc(size int) (arenaAddr, []byte) {

@@ -6,11 +6,48 @@ import (
 	"unsafe"
 )
 
+type KeyFlags uint8
+
 const (
 	// bit 1 => red, bit 0 => black
 	nodeColorBit  uint8 = 0x80
 	nodeFlagsMark       = nodeColorBit - 1
 )
+
+type nodeAllocator struct {
+	arena
+	nullNode memdbNode
+}
+
+func (a *nodeAllocator) init() {
+	a.nullNode = memdbNode{
+		up:    nullAddr,
+		left:  nullAddr,
+		right: nullAddr,
+		vptr:  nullAddr,
+	}
+}
+
+func (a *nodeAllocator) getNode(addr arenaAddr) *memdbNode {
+	if addr.isNull() {
+		return &a.nullNode
+	}
+
+	return (*memdbNode)(unsafe.Pointer(&a.blocks[addr.idx].buf[addr.off]))
+}
+
+func (a *nodeAllocator) allocNode(key []byte) (arenaAddr, *memdbNode) {
+	nodeSize := 8*4 + 2 + 1 + len(key)
+	addr, mem := a.alloc(nodeSize)
+	n := (*memdbNode)(unsafe.Pointer(&mem[0]))
+	n.klen = uint16(len(key))
+	copy(n.getKey(), key)
+	return addr, n
+}
+
+func (a *nodeAllocator) freeNode(addr arenaAddr) {
+	// TODO: we can reuse node's space.
+}
 
 type memdbNode struct {
 	up    arenaAddr
@@ -47,15 +84,33 @@ func (n *memdbNode) getKey() []byte {
 }
 
 type memdb struct {
-	root       arenaAddr
-	indexArena arena
+	root      arenaAddr
+	allocator nodeAllocator
+	vlog      memdbVlog
 }
 
 func newMemDB() *memdb {
 	db := new(memdb)
-	db.indexArena.init()
+	db.allocator.init()
 	db.root = nullAddr
 	return db
+}
+
+func (db *memdb) Get(key []byte) ([]byte, bool) {
+	_, xn := db.tranverse(key, false)
+	if xn == nil {
+		return nil, false
+	}
+	if xn.vptr.isNull() {
+		// A flag only key, act as value not exists
+		return nil, false
+	}
+	return db.vlog.getValue(xn.vptr), true
+}
+
+func (db *memdb) Set(key, value []byte) {
+	x, xn := db.tranverse(key, true)
+	xn.vptr = db.vlog.appendValue(x, xn.vptr, value)
 }
 
 // tranverse search for and if not found and insert is true, will add a new node in.
@@ -72,7 +127,7 @@ func (db *memdb) tranverse(key []byte, insert bool) (arenaAddr, *memdbNode) {
 	// walk x down the tree
 	for !x.isNull() && !found {
 		y = x
-		xn = db.indexArena.getNode(x)
+		xn = db.allocator.getNode(x)
 		cmp := bytes.Compare(key, xn.getKey())
 		if cmp < 0 {
 			x = xn.left
@@ -90,8 +145,8 @@ func (db *memdb) tranverse(key []byte, insert bool) (arenaAddr, *memdbNode) {
 		return x, xn
 	}
 
-	z, zn = db.indexArena.allocNode(key)
-	yn = db.indexArena.getNode(y)
+	z, zn = db.allocator.allocNode(key)
+	yn = db.allocator.getNode(y)
 	zn.up = y
 
 	if y.isNull() {
@@ -116,7 +171,7 @@ func (db *memdb) tranverse(key []byte, insert bool) (arenaAddr, *memdbNode) {
 	x = z
 	xn = zn
 
-	a := db.indexArena
+	a := db.allocator
 
 	// While we are not at the top and our parent node is red
 	// N.B. Since the root node is garanteed black, then we
@@ -208,14 +263,14 @@ func (db *memdb) tranverse(key []byte, insert bool) (arenaAddr, *memdbNode) {
 
 func (db *memdb) leftRotate(x arenaAddr, xn *memdbNode) {
 	y := xn.right
-	yn := db.indexArena.getNode(y)
+	yn := db.allocator.getNode(y)
 
 	// Turn Y's left subtree into X's right subtree (move B)
 	xn.right = yn.left
 
 	// If B is not null, set it's parent to be X
 	if !yn.left.isNull() {
-		db.indexArena.getNode(yn.left).up = x
+		db.allocator.getNode(yn.left).up = x
 	}
 
 	// Set Y's parent to be what X's parent was
@@ -225,7 +280,7 @@ func (db *memdb) leftRotate(x arenaAddr, xn *memdbNode) {
 	if xn.up.isNull() {
 		db.root = y
 	} else {
-		xupn := db.indexArena.getNode(xn.up)
+		xupn := db.allocator.getNode(xn.up)
 		// Set X's parent's left or right pointer to be Y
 		if x == xupn.left {
 			xupn.left = y
@@ -242,14 +297,14 @@ func (db *memdb) leftRotate(x arenaAddr, xn *memdbNode) {
 
 func (db *memdb) rightRotate(y arenaAddr, yn *memdbNode) {
 	x := yn.left
-	xn := db.indexArena.getNode(x)
+	xn := db.allocator.getNode(x)
 
 	// Turn X's right subtree into Y's left subtree (move B)
 	yn.left = xn.right
 
 	// If B is not null, set it's parent to be Y
 	if !xn.right.isNull() {
-		db.indexArena.getNode(xn.right).up = y
+		db.allocator.getNode(xn.right).up = y
 	}
 
 	// Set X's parent to be what Y's parent was
@@ -259,7 +314,7 @@ func (db *memdb) rightRotate(y arenaAddr, yn *memdbNode) {
 	if yn.up.isNull() {
 		db.root = x
 	} else {
-		yupn := db.indexArena.getNode(yn.up)
+		yupn := db.allocator.getNode(yn.up)
 		// Set Y's parent's left or right pointer to be X
 		if y == yupn.left {
 			yupn.left = x
@@ -297,10 +352,10 @@ func (db *memdb) deleteNode(z arenaAddr, zn *memdbNode) {
 
 	if !yn.left.isNull() {
 		x = yn.left
-		xn = db.indexArena.getNode(x)
+		xn = db.allocator.getNode(x)
 	} else {
 		x = yn.right
-		xn = db.indexArena.getNode(x)
+		xn = db.allocator.getNode(x)
 	}
 
 	xn.up = yn.up
@@ -308,7 +363,7 @@ func (db *memdb) deleteNode(z arenaAddr, zn *memdbNode) {
 	if yn.up.isNull() {
 		db.root = x
 	} else {
-		yupn := db.indexArena.getNode(yn.up)
+		yupn := db.allocator.getNode(yn.up)
 		if y == yupn.left {
 			yupn.left = x
 		} else {
@@ -326,12 +381,12 @@ func (db *memdb) deleteNode(z arenaAddr, zn *memdbNode) {
 		db.deleteNodeFix(x, xn)
 	}
 
-	db.indexArena.freeNode(z)
+	db.allocator.freeNode(z)
 }
 
 func (db *memdb) replaceNode(x arenaAddr, xn *memdbNode, y arenaAddr, yn *memdbNode) {
 	if !yn.up.isNull() {
-		yupn := db.indexArena.getNode(yn.up)
+		yupn := db.allocator.getNode(yn.up)
 		if y == yupn.left {
 			yupn.left = x
 		} else {
@@ -343,12 +398,12 @@ func (db *memdb) replaceNode(x arenaAddr, xn *memdbNode, y arenaAddr, yn *memdbN
 	xn.up = yn.up
 
 	if !yn.left.isNull() {
-		db.indexArena.getNode(yn.left).up = x
+		db.allocator.getNode(yn.left).up = x
 	}
 	xn.left = yn.left
 
 	if !yn.right.isNull() {
-		db.indexArena.getNode(yn.right).up = x
+		db.allocator.getNode(yn.right).up = x
 	}
 	xn.right = yn.right
 
@@ -360,7 +415,7 @@ func (db *memdb) replaceNode(x arenaAddr, xn *memdbNode, y arenaAddr, yn *memdbN
 }
 
 func (db *memdb) deleteNodeFix(x arenaAddr, xn *memdbNode) {
-	a := db.indexArena
+	a := db.allocator
 	for x != db.root && xn.isBlack() {
 		xupn := a.getNode(xn.up)
 		if x == xupn.left {
@@ -447,10 +502,10 @@ func (db *memdb) successor(x arenaAddr, xn *memdbNode) (y arenaAddr, yn *memdbNo
 		// no left pointer.
 
 		y = xn.right
-		yn = db.indexArena.getNode(y)
+		yn = db.allocator.getNode(y)
 		for !yn.left.isNull() {
 			y = yn.left
-			yn = db.indexArena.getNode(y)
+			yn = db.allocator.getNode(y)
 		}
 		return
 	}
@@ -461,7 +516,7 @@ func (db *memdb) successor(x arenaAddr, xn *memdbNode) (y arenaAddr, yn *memdbNo
 
 	y = xn.up
 	for !y.isNull() {
-		yn = db.indexArena.getNode(y)
+		yn = db.allocator.getNode(y)
 		if x != yn.right {
 			break
 		}
@@ -478,10 +533,10 @@ func (db *memdb) predecessor(x arenaAddr, xn *memdbNode) (y arenaAddr, yn *memdb
 		// no right pointer.
 
 		y = xn.left
-		yn = db.indexArena.getNode(y)
+		yn = db.allocator.getNode(y)
 		for !yn.right.isNull() {
 			y = yn.right
-			yn = db.indexArena.getNode(y)
+			yn = db.allocator.getNode(y)
 		}
 		return
 	}
@@ -492,7 +547,7 @@ func (db *memdb) predecessor(x arenaAddr, xn *memdbNode) (y arenaAddr, yn *memdb
 
 	y = xn.up
 	for !y.isNull() {
-		yn = db.indexArena.getNode(y)
+		yn = db.allocator.getNode(y)
 		if x != yn.left {
 			break
 		}
