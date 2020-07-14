@@ -6,6 +6,8 @@ import (
 	"unsafe"
 )
 
+type Key = []byte
+
 type KeyFlags uint8
 
 const (
@@ -36,7 +38,7 @@ func (a *nodeAllocator) getNode(addr arenaAddr) *memdbNode {
 	return (*memdbNode)(unsafe.Pointer(&a.blocks[addr.idx].buf[addr.off]))
 }
 
-func (a *nodeAllocator) allocNode(key []byte) (arenaAddr, *memdbNode) {
+func (a *nodeAllocator) allocNode(key Key) (arenaAddr, *memdbNode) {
 	nodeSize := 8*4 + 2 + 1 + len(key)
 	addr, mem := a.alloc(nodeSize)
 	n := (*memdbNode)(unsafe.Pointer(&mem[0]))
@@ -74,7 +76,7 @@ func (n *memdbNode) setBlack() {
 	n.flags &= ^nodeColorBit
 }
 
-func (n *memdbNode) getKey() []byte {
+func (n *memdbNode) getKey() Key {
 	var ret []byte
 	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&ret))
 	hdr.Data = uintptr(unsafe.Pointer(&n.flags)) + 1
@@ -96,7 +98,7 @@ func newMemDB() *memdb {
 	return db
 }
 
-func (db *memdb) Get(key []byte) ([]byte, bool) {
+func (db *memdb) Get(key Key) ([]byte, bool) {
 	_, xn := db.tranverse(key, false)
 	if xn == nil {
 		return nil, false
@@ -108,14 +110,14 @@ func (db *memdb) Get(key []byte) ([]byte, bool) {
 	return db.vlog.getValue(xn.vptr), true
 }
 
-func (db *memdb) Set(key, value []byte) {
+func (db *memdb) Set(key Key, value []byte) {
 	x, xn := db.tranverse(key, true)
 	xn.vptr = db.vlog.appendValue(x, xn.vptr, value)
 }
 
 // tranverse search for and if not found and insert is true, will add a new node in.
 // Returns a pointer to the new node, or the node found.
-func (db *memdb) tranverse(key []byte, insert bool) (arenaAddr, *memdbNode) {
+func (db *memdb) tranverse(key Key, insert bool) (arenaAddr, *memdbNode) {
 	var (
 		x          = db.root
 		y          = nullAddr
@@ -329,7 +331,7 @@ func (db *memdb) rightRotate(y arenaAddr, yn *memdbNode) {
 	yn.up = x
 }
 
-func (db *memdb) delete(key []byte) {
+func (db *memdb) delete(key Key) {
 	x, xn := db.tranverse(key, false)
 	if x.isNull() {
 		return
@@ -518,12 +520,12 @@ func (db *memdb) successor(x arenaAddr, xn *memdbNode) (y arenaAddr, yn *memdbNo
 	for !y.isNull() {
 		yn = db.allocator.getNode(y)
 		if x != yn.right {
-			break
+			return y, yn
 		}
 		x = y
 		y = yn.up
 	}
-	return
+	return nullAddr, nil
 }
 
 func (db *memdb) predecessor(x arenaAddr, xn *memdbNode) (y arenaAddr, yn *memdbNode) {
@@ -549,10 +551,10 @@ func (db *memdb) predecessor(x arenaAddr, xn *memdbNode) (y arenaAddr, yn *memdb
 	for !y.isNull() {
 		yn = db.allocator.getNode(y)
 		if x != yn.left {
-			break
+			return y, yn
 		}
 		x = y
 		y = yn.up
 	}
-	return
+	return nullAddr, nil
 }
